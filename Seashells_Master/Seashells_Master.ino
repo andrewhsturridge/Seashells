@@ -30,8 +30,19 @@ struct Picks {
 };
 
 // ---------- Globals ----------
-enum State { IDLE, BUILD, ANNOUNCE, WAIT };
+enum State { IDLE, BUILD, ANNOUNCE, WAIT, PAUSE };
 static State g_state = IDLE;
+
+// Blink cadence (match what you send in cmdBlinkAll)
+static const uint8_t  BLINK_REPS              = 3;
+static const uint16_t BLINK_ON_MS_CORRECT     = 140;
+static const uint16_t BLINK_OFF_MS_CORRECT    = 120;
+static const uint16_t BLINK_ON_MS_WRONG       = 160;
+static const uint16_t BLINK_OFF_MS_WRONG      = 140;
+
+// Pause bookkeeping
+static uint32_t resultPauseUntil = 0;
+static State    nextAfterBlink   = IDLE;
 
 static Picks picksA, picksB;                      // replies from Side A/B
 static volatile uint8_t lastSide = 255, lastSlot = 255;  // BTN_EVENT inbox
@@ -53,8 +64,6 @@ static void addPeer(const uint8_t mac[6]) {
 
 static void sendPkt(const uint8_t mac[6], const void* data, size_t n) {
   // Send twice for resilience on noisy RF
-  esp_now_send(mac, (const uint8_t*)data, n);
-  delay(3);
   esp_now_send(mac, (const uint8_t*)data, n);
 }
 
@@ -361,8 +370,8 @@ void loop() {
 
     case ANNOUNCE:
       // Lights white; loop all slots continuously until selection or timeout
-      cmdLedAllWhite();
       cmdStartLoopAll();
+      cmdLedAllWhite();
       lastSide = lastSlot = 255;
       t0 = millis();
       g_state = WAIT;
@@ -372,39 +381,50 @@ void loop() {
       // Timeout -> lose
       if (millis() - t0 > PICK_WINDOW_MS[roundIdx]) {
         cmdStopAll();
-        cmdBlinkAll(/*red*/0, 160, 140);
-        g_state = IDLE;
+        cmdBlinkAll(/*red*/0, BLINK_ON_MS_WRONG, BLINK_OFF_MS_WRONG);
+        resultPauseUntil = millis() + BLINK_REPS * (BLINK_ON_MS_WRONG + BLINK_OFF_MS_WRONG) + 100;
+        nextAfterBlink   = IDLE;
+        g_state          = PAUSE;
         break;
       }
 
-      // First press -> evaluate
       if (lastSide != 255) {
-        cmdStopAll(); // stop announce loops immediately
-
-        bool correct = false;
-        if      (lastSide == 0) correct = slotIsOdd_A[lastSlot & 3];
-        else if (lastSide == 1) correct = slotIsOdd_B[lastSlot & 3];
+        cmdStopAll(); // stop announce loops
+        bool correct = (lastSide==0) ? slotIsOdd_A[lastSlot & 3] : slotIsOdd_B[lastSlot & 3];
 
         if (correct) {
-          cmdBlinkAll(/*green*/1, 140, 120);
+          cmdBlinkAll(/*green*/1, BLINK_ON_MS_CORRECT, BLINK_OFF_MS_CORRECT);
+          resultPauseUntil = millis() + BLINK_REPS * (BLINK_ON_MS_CORRECT + BLINK_OFF_MS_CORRECT) + 100;
+
+          // Decide what comes AFTER the blink:
           if (++points >= 3) {
             points = 0;
             if (++roundIdx >= 3) {
-              // Win
-              cmdBlinkAll(/*white*/2, 220, 120);
-              g_state = IDLE;
+              // Win (keep your white-win blink if you like; if you do, recalc pause for that cadence)
+              // cmdBlinkAll(/*white*/2, 220, 120);
+              // resultPauseUntil = millis() + BLINK_REPS * (220 + 120) + 120;
+              nextAfterBlink = IDLE;
             } else {
-              g_state = BUILD; // next round (shorter time limit)
+              nextAfterBlink = BUILD;  // next round (shorter timer)
             }
           } else {
-            g_state = BUILD; // next point in same round
+            nextAfterBlink = BUILD;    // next point in same round
           }
+          g_state = PAUSE;
+
         } else {
-          cmdBlinkAll(/*red*/0, 160, 140);
-          g_state = IDLE;
+          cmdBlinkAll(/*red*/0, BLINK_ON_MS_WRONG, BLINK_OFF_MS_WRONG);
+          resultPauseUntil = millis() + BLINK_REPS * (BLINK_ON_MS_WRONG + BLINK_OFF_MS_WRONG) + 100;
+          nextAfterBlink   = IDLE;
+          g_state          = PAUSE;
         }
       }
+    } break;
+
+    case PAUSE:
+      if (millis() >= resultPauseUntil) {
+        g_state = nextAfterBlink;
+      }
       break;
-    }
   }
 }

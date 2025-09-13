@@ -156,7 +156,10 @@ void GameBus_sendBtnEvent(uint8_t slotIdx) {
 }
 
 // Default mappings to the .ino functions
-void GB_onSetScene(uint16_t ids[4]) { side_setScene(ids); }
+void GB_onSetScene(uint16_t ids[4]) { 
+  side_ledAllWhite();
+  side_setScene(ids); 
+  }
 void GB_onRequestRandom(uint8_t needA, uint8_t needB) {
   // Pick random unique IDs from pools and reply with RANDOM_SET_REPLY
   uint16_t a[4]={0}, b[4]={0};
@@ -182,5 +185,8 @@ void GB_onBlinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms) {
   side_blinkAll(color, on_ms, off_ms);
 }
 void GB_onGameMode(bool enabled) { side_setGameMode(enabled); }
-void GB_onStartLoopAll() { side_startLoopAll(); }
+void GB_onStartLoopAll() {
+  side_ledAllWhite();   // cancels blink + sets solid white
+  side_startLoopAll();  // begin audio looping
+}
 void GB_onStopAll() { side_stopAll(); }
