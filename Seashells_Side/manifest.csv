@@ -1,0 +1,9 @@
+# id,pool,path,precache,volume_db,tags
+# Pool A: the "same" pool (7 of these will play across both sides)
+1001,A,/poolA/1001.wav,1,-3,soft
+1002,A,/poolA/1002.wav,1,-3,
+1003,A,/poolA/1003.wav,1,-3,
+1004,A,/poolA/1004.wav,1,-3,
+# Pool B: the "odd" pool (only 1 should be present across both sides each round)
+1101,B,/poolB/1101.wav,1,-2,bright
+1102,B,/poolB/1102.wav,0,0,metal
