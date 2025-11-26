@@ -4,13 +4,26 @@
 #include "driver/i2s.h"
 #include "ConfigSide.h"   // pins, SAMPLE_RATE, SD_* defines
 
-// ---- Playback state & channel types (moved out of the .ino) ----
+// ---- Playback state & channel types ----
 enum PlayState : uint8_t { IDLE=0, PLAYING=1, LOOPING=2 };
+
+// Source for a channel: file-backed (WAV) or synthetic tone
+enum ToneMode : uint8_t {
+  TONE_NONE = 0,
+  TONE_SIMPLE = 1,
+  TONE_SWEEP_UP = 2,
+  TONE_SWEEP_DOWN = 3,
+  TONE_SIREN = 4,
+  TONE_NOISE = 5,
+  TONE_DOUBLE_CLICK = 6,
+  TONE_TRIPLE_BEEP = 7
+};
 
 struct TrackRAM { int16_t* data = nullptr; size_t samples = 0; };
 struct TrackSD  { File f; uint32_t dataStart = 44, dataEnd = 44, cur = 0; };
 
 struct Channel {
+  // File-backed audio fields
   String   path;
   PlayState state = IDLE;
   uint8_t   vol   = 255;
@@ -19,6 +32,16 @@ struct Channel {
   TrackRAM  ram;
   TrackSD   sd;
   int16_t   gainQ15 = 32767;   // Q1.15
+
+  // Tone synthesis fields (used when isTone = true)
+  bool      isTone = false;
+  ToneMode  toneMode = TONE_NONE;
+  float     toneFreq1 = 440.0f;     // base frequency (Hz)
+  float     toneFreq2 = 880.0f;     // secondary freq for sweeps/siren (Hz)
+  float     tonePhase = 0.0f;       // 0..2π
+  float     toneSweepPos = 0.0f;    // 0..1 for sweeps/LFO
+  float     toneSweepRate = 0.0f;   // step per sample for sweepPos
+  uint32_t  tonePatternSamples = 0; // for rhythmic patterns
 };
 
 // Global channels live in your .ino; this gives us access here

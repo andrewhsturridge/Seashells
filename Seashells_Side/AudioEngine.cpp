@@ -1,9 +1,11 @@
 #include "AudioEngine.h"
 #include <SPI.h>
+#include <math.h>
 
 // Local constants used by helpers (keep in sync with your .ino)
 static constexpr size_t kFrameSamples = 1024;          // per-channel samples/frame
 static constexpr size_t kBytesPerCh   = kFrameSamples * 2; // 16-bit mono
+static constexpr float  kTwoPi        = 6.28318530718f;
 
 // ───────────────── SD & WAV helpers ─────────────────
 
@@ -32,7 +34,9 @@ bool remountAndReopenAll(uint32_t hz1, uint32_t hz2) {
   if (!remountSD(hz1)) if (!remountSD(hz2)) return false;
   bool any = false;
   for (int i=0;i<4;++i) {
-    if (ch[i].useRAM) { any = true; continue; } // RAM cached: nothing to reopen
+    if (ch[i].useRAM || ch[i].isTone) { any = true; continue; } // RAM cached or tone: nothing to reopen
+    if (!ch[i].path.length()) continue;
+
     File f = SD.open(ch[i].path.c_str(), FILE_READ);
     if (f) {
       ch[i].sd.f = f;
@@ -49,6 +53,10 @@ bool remountAndReopenAll(uint32_t hz1, uint32_t hz2) {
 
 bool openForSD(Channel& C, int idx) {
   if (C.sd.f) C.sd.f.close();
+  if (!C.path.length()) {
+    Serial.printf("CH%d: OPEN (no path)\n", idx+1);
+    return false;
+  }
   C.sd.f = SD.open(C.path.c_str(), FILE_READ);
   Serial.printf("CH%d: OPEN %s %s\n", idx+1, C.path.c_str(), C.sd.f?"OK":"FAIL");
   if (!C.sd.f) return false;
@@ -86,7 +94,7 @@ bool loadWavIntoRam(const char* path, const char* tag, int16_t** outBuf, size_t*
 }
 
 size_t sdReadReliable(Channel& C, uint8_t* dst, size_t want) {
-  if (C.useRAM) return 0; // not used here
+  if (C.useRAM || C.isTone) return 0; // not used here
   uint8_t retries = 0; bool remounted = false;
   size_t total = 0;
   uint32_t dataBytes = C.sd.dataEnd - C.sd.dataStart;
@@ -95,8 +103,10 @@ size_t sdReadReliable(Channel& C, uint8_t* dst, size_t want) {
     if (!C.sd.f) {
       if (retries < 2) {
         retries++;
-        File f = SD.open(C.path.c_str(), FILE_READ);
-        if (f) { C.sd.f = f; C.sd.f.seek(C.sd.dataStart + C.sd.cur); continue; }
+        if (C.path.length()) {
+          File f = SD.open(C.path.c_str(), FILE_READ);
+          if (f) { C.sd.f = f; C.sd.f.seek(C.sd.dataStart + C.sd.cur); continue; }
+        }
       }
       if (!remounted) {
         remounted = true;
@@ -120,10 +130,136 @@ size_t sdReadReliable(Channel& C, uint8_t* dst, size_t want) {
   return total;
 }
 
+// ───────────────── Tone synthesis ─────────────────
+
+// Generate a single sample for a tone channel, in [-1.0, +1.0].
+static float synthNextSample(Channel& C) {
+  const float sr = (float)SAMPLE_RATE;
+  float s = 0.0f;
+
+  switch (C.toneMode) {
+    case TONE_SIMPLE: {
+      float freq = C.toneFreq1;
+      float inc  = kTwoPi * freq / sr;
+      C.tonePhase += inc;
+      if (C.tonePhase > kTwoPi) C.tonePhase -= kTwoPi;
+      s = sinf(C.tonePhase) * 0.35f;
+    } break;
+
+    case TONE_SWEEP_UP:
+    case TONE_SWEEP_DOWN: {
+      if (C.toneSweepRate <= 0.0f) {
+        C.toneSweepRate = 1.0f / (sr * 0.4f); // ~400ms sweep
+      }
+      C.toneSweepPos += C.toneSweepRate;
+      if (C.toneSweepPos >= 1.0f) C.toneSweepPos -= 1.0f;
+
+      float t = C.toneSweepPos;
+      if (C.toneMode == TONE_SWEEP_DOWN) t = 1.0f - t;
+      float freq = C.toneFreq1 + (C.toneFreq2 - C.toneFreq1) * t;
+      float inc  = kTwoPi * freq / sr;
+      C.tonePhase += inc;
+      if (C.tonePhase > kTwoPi) C.tonePhase -= kTwoPi;
+      s = sinf(C.tonePhase) * 0.35f;
+    } break;
+
+    case TONE_SIREN: {
+      if (C.toneSweepRate <= 0.0f) {
+        C.toneSweepRate = 1.0f / (sr * 1.2f); // ~1.2s LFO
+      }
+      C.toneSweepPos += C.toneSweepRate;
+      if (C.toneSweepPos >= 1.0f) C.toneSweepPos -= 1.0f;
+      float lfo = sinf(kTwoPi * C.toneSweepPos); // -1..+1
+
+      float fMid = 0.5f * (C.toneFreq1 + C.toneFreq2);
+      float fDev = 0.5f * (C.toneFreq2 - C.toneFreq1);
+      float freq = fMid + fDev * lfo;
+
+      float inc  = kTwoPi * freq / sr;
+      C.tonePhase += inc;
+      if (C.tonePhase > kTwoPi) C.tonePhase -= kTwoPi;
+      s = sinf(C.tonePhase) * 0.35f;
+    } break;
+
+    case TONE_NOISE: {
+      // Simple white noise in [-0.4, +0.4]
+      int32_t r = (int32_t)random(-32768, 32767);
+      s = (float)r / 32768.0f * 0.4f;
+    } break;
+
+    case TONE_DOUBLE_CLICK:
+    case TONE_TRIPLE_BEEP: {
+      const float freq = C.toneFreq1;
+      const float inc  = kTwoPi * freq / sr;
+
+      const uint32_t beepSamples = (uint32_t)(sr * 0.04f); // 40 ms beep
+      const uint32_t gapSamples  = (uint32_t)(sr * 0.04f); // 40 ms gap
+
+      uint32_t patternTotal = 0;
+      if (C.toneMode == TONE_DOUBLE_CLICK) {
+        // beep, gap, beep, long gap
+        patternTotal = beepSamples + gapSamples + beepSamples + (gapSamples * 4);
+      } else {
+        // triple beep: beep,gap,beep,gap,beep,long gap
+        patternTotal = (beepSamples * 3) + (gapSamples * 5);
+      }
+
+      uint32_t pos = C.tonePatternSamples % (patternTotal ? patternTotal : 1);
+      C.tonePatternSamples++;
+
+      bool on = false;
+      if (C.toneMode == TONE_DOUBLE_CLICK) {
+        if (pos < beepSamples) on = true; // first beep
+        else if (pos >= (beepSamples + gapSamples) &&
+                 pos < (beepSamples + gapSamples + beepSamples)) on = true; // second beep
+      } else {
+        // triple beep
+        if (pos < beepSamples) on = true; // first
+        else if (pos >= (beepSamples + gapSamples) &&
+                 pos < (beepSamples + gapSamples + beepSamples)) on = true; // second
+        else if (pos >= (2*beepSamples + 2*gapSamples) &&
+                 pos < (2*beepSamples + 2*gapSamples + beepSamples)) on = true; // third
+      }
+
+      if (on) {
+        C.tonePhase += inc;
+        if (C.tonePhase > kTwoPi) C.tonePhase -= kTwoPi;
+        s = sinf(C.tonePhase) * 0.4f;
+      } else {
+        s = 0.0f;
+      }
+    } break;
+
+    default:
+    case TONE_NONE:
+      s = 0.0f;
+      break;
+  }
+
+  return s;
+}
+
+// ───────────────── Frame filling ─────────────────
+
 void fillChannelFrame(int idx, int16_t* dst) {
   Channel& C = ch[idx];
+
   if (C.state == IDLE) {
     memset(dst, 0, kFrameSamples * 2);
+    return;
+  }
+
+  // Tone-backed channel: synthesize samples
+  if (C.isTone && C.toneMode != TONE_NONE) {
+    for (size_t n = 0; n < kFrameSamples; n++) {
+      float s = synthNextSample(C);
+      int32_t v = (int32_t)(s * 32767.0f);
+      if (v >  32767) v =  32767;
+      if (v < -32768) v = -32768;
+      dst[n] = (int16_t)v;
+    }
+    // LOOPING tones just run until stopped externally.
+    // PLAYING tones also run until state is changed; no auto-stop yet.
     return;
   }
 

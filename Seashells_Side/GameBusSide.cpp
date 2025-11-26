@@ -35,20 +35,13 @@ static void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int
 
   // 1) ONLY accept packets from Master
   if (std::memcmp(info->src_addr, MASTER_MAC, 6) != 0) {
-    // Uncomment for debug to see stray traffic:
-    // Serial.printf("[NOW] IGNORE from %02X:%02X:%02X:%02X:%02X:%02X type=%u len=%d\n",
-    //   info->src_addr[0],info->src_addr[1],info->src_addr[2],
-    //   info->src_addr[3],info->src_addr[4],info->src_addr[5], data[0], len);
     return;
   }
 
   const uint8_t type = data[0];
-  // Uncomment to watch your own control flow:
-  // Serial.printf("[NOW] from MASTER type=%u len=%d\n", type, len);
 
   switch (type) {
     case SET_SCENE: {
-      // type(1) + 4 * uint16 = 9 bytes
       if (len < 1 + 8) return;
       uint16_t ids[4];
       for (int i = 0; i < 4; i++) {
@@ -58,24 +51,20 @@ static void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int
     } break;
 
     case REQUEST_RANDOM_SET: {
-      // type(1) + needA(1) + needB(1) = 3
       if (len < 3) return;
       GB_onRequestRandom(data[1], data[2]);
     } break;
 
     case PLAY_SLOT: {
-      // type(1) + slot(1) = 2
       if (len < 2) return;
       GB_onPlaySlot(data[1] & 3);
     } break;
 
     case LED_ALL_WHITE: {
-      // type(1)
       GB_onLedAllWhite();
     } break;
 
     case BLINK_ALL: {
-      // type(1) + color(1) + on_ms(2) + off_ms(2) = 6
       if (len < 6) return;
       uint8_t  color  = data[1];
       uint16_t on_ms  = ((uint16_t)data[2] << 8) | data[3];
@@ -84,7 +73,6 @@ static void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int
     } break;
 
     case GAME_MODE: {
-      // type(1) + enabled(1) = 2
       if (len < 2) return;
       GB_onGameMode(data[1] != 0);
     } break;
@@ -102,8 +90,6 @@ static void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int
       uint8_t newId = data[1] & 1;          // 0=A, 1=B
       Serial.printf("[SIDE] ROLE_ASSIGN %u\n", newId);
       Role::set(newId, /*persist*/true);
-      // optional: re-HELLO the master so it sees new id immediately
-      // GameBus_sendHello(/*aCount*/..., /*bCount*/...); // or just rely on next message
     } break;
     
     case OTA_UPDATE: {
@@ -111,13 +97,11 @@ static void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int
       uint8_t ulen = data[1];
       if (ulen == 0 || (int)ulen > len - 2) return;
 
-      // Copy URL bytes and request OTA start (handled in loop())
       side_setOtaUrl((const char*)(data+2), ulen);
       side_requestOtaStart();
       return;
     }
 
-    // Side doesn't expect RANDOM_SET_REPLY or HELLO from Master here
     default:
       break;
   }
@@ -159,34 +143,44 @@ void GameBus_sendBtnEvent(uint8_t slotIdx) {
 void GB_onSetScene(uint16_t ids[4]) { 
   side_ledAllWhite();
   side_setScene(ids); 
-  }
-void GB_onRequestRandom(uint8_t needA, uint8_t needB) {
-  // Pick random unique IDs from pools and reply with RANDOM_SET_REPLY
-  uint16_t a[4]={0}, b[4]={0};
-  uint8_t nA = Manifest_pickRandom(POOL_A, needA, a, 4);
-  uint8_t nB = Manifest_pickRandom(POOL_B, needB, b, 4);
+}
 
-  uint8_t pkt[1+1+1+2*4+2*4]; // type + countA + countB + idsA + idsB (fixed room)
+// NEW: category-based random selection for proof-of-concept
+// For now:
+//   - "same" (A bucket)  = base="animals"
+//   - "odd"  (B bucket)  = base!="animals"  (tones, and any other non-animal bases later)
+void GB_onRequestRandom(uint8_t needA, uint8_t needB) {
+  uint16_t a[4]={0}, b[4]={0};
+
+  // Same pool: animals
+  uint8_t nA = Manifest_pickRandomByBase("animals", needA, a, 4);
+
+  // Odd pool: anything not animals (currently tones only)
+  uint8_t nB = Manifest_pickRandomByBaseNot("animals", needB, b, 4);
+
+  uint8_t pkt[1+1+1+2*4+2*4]; // type + countA + countB + idsA + idsB
   uint8_t idx=0;
   pkt[idx++]=RANDOM_SET_REPLY;
   pkt[idx++]=nA;
   pkt[idx++]=nB;
-  for (uint8_t i=0;i<nA;i++){ pkt[idx++]=a[i]>>8; pkt[idx++]=a[i]&0xFF; }
-  for (uint8_t pad=nA; pad<4; pad++){ pkt[idx++]=0; pkt[idx++]=0; } // pad
-  for (uint8_t i=0;i<nB;i++){ pkt[idx++]=b[i]>>8; pkt[idx++]=b[i]&0xFF; }
-  for (uint8_t pad=nB; pad<4; pad++){ pkt[idx++]=0; pkt[idx++]=0; } // pad
+
+  for (uint8_t i=0;i<nA && i<4;i++){ pkt[idx++]=a[i]>>8; pkt[idx++]=a[i]&0xFF; }
+  for (uint8_t pad=nA; pad<4; pad++){ pkt[idx++]=0; pkt[idx++]=0; }
+
+  for (uint8_t i=0;i<nB && i<4;i++){ pkt[idx++]=b[i]>>8; pkt[idx++]=b[i]&0xFF; }
+  for (uint8_t pad=nB; pad<4; pad++){ pkt[idx++]=0; pkt[idx++]=0; }
+
   esp_now_send(MASTER_MAC, pkt, idx);
 }
+
 void GB_onPlaySlot(uint8_t slot) { side_playSlot(slot); }
-void GB_onLedAllWhite() {
-  side_ledAllWhite();
-}
+void GB_onLedAllWhite() { side_ledAllWhite(); }
 void GB_onBlinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms) {
   side_blinkAll(color, on_ms, off_ms);
 }
 void GB_onGameMode(bool enabled) { side_setGameMode(enabled); }
 void GB_onStartLoopAll() {
-  side_ledAllWhite();   // cancels blink + sets solid white
-  side_startLoopAll();  // begin audio looping
+  side_ledAllWhite();
+  side_startLoopAll();
 }
 void GB_onStopAll() { side_stopAll(); }
