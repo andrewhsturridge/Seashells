@@ -25,9 +25,6 @@
 // Master trim for this side (in dB). Use 0 for unity, negatives to reduce.
 #define MASTER_GAIN_DB -40
 
-static volatile bool otaStartRequested = false;
-static String otaUrl;
-
 // ======= RGB setup =======
 #define NUM_LEDS_PER  1
 Adafruit_NeoPixel rgb1(NUM_LEDS_PER, RGB1_PIN, NEO_GRB + NEO_KHZ800);
@@ -311,23 +308,7 @@ void setup() {
 
 // ======= Main loop =======
 void loop() {
-  if (otaStartRequested) {
-    otaStartRequested = false;
-    // Optional: pause local logic/LEDs if you want
-    side_blinkAll(/*white*/2, 60, 60);
-    otaShowProgress(0);
-
-    // TREX-like: join STA, HTTP GET, chunked Update, verify, reboot
-    bool ok = side_doOTA(otaUrl);
-    if (!ok) {
-      // Failed → back to ESPNOW; visual fail matches TREX
-      side_blinkAll(/*red*/0, 160, 120);
-      WiFi.disconnect(true,true);
-      WiFi.mode(WIFI_OFF);
-    }
-    // On success side_doOTA() reboots, so we never reach here
-  }
-
+  // Pump OTA module (triggered via ESP-NOW OTA_UPDATE)
   Ota_loopTick();
 
   uint32_t now = millis();

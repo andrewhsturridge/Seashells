@@ -5,8 +5,12 @@
 
 // ------- ESP-NOW / WiFi -------
 #define WIFI_CHANNEL 6
-#define OTA_WIFI_SSID  "GUD"
-#define OTA_WIFI_PASS  "EscapE66"
+
+// These are ONLY used during OTA updates, not for ESP-NOW.
+// Set them to your PHONE HOTSPOT SSID + password.
+#define OTA_WIFI_SSID  "AndrewiPhone"
+#define OTA_WIFI_PASS  "12345678"
+
 #define OTA_CONNECT_TIMEOUT_MS 15000
 #define OTA_HTTP_TIMEOUT_MS    45000
 
