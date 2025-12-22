@@ -31,7 +31,7 @@ struct Channel {
   bool      useRAM = false;
   TrackRAM  ram;
   TrackSD   sd;
-  int16_t   gainQ15 = 32767;   // Q1.15
+  int32_t   gainQ15 = 32768;   // Q15 (1.0 == 32768)
 
   // Tone synthesis fields (used when isTone = true)
   bool      isTone = false;
@@ -58,10 +58,10 @@ void     fillChannelFrame(int idx, int16_t* dst);  // uses internal frame consta
 void     i2s_init_common(i2s_port_t port, int dout, int bclk, int lrck);
 
 // Volume helpers & master gain (moved out of .ino)
-int16_t  q15_from_db(int8_t db);
-int16_t  q15_mul(int16_t a, int16_t b);
-void     applyGain(int16_t* buf, size_t n, int16_t g);
+int32_t  q15_from_db(int8_t db);
+int32_t  q15_mul(int32_t a, int32_t b);
+void     applyGain(int16_t* buf, size_t n, int32_t g);
 
 // Exposed so you can set it once from the .ino, e.g.:
 //   masterGainQ15 = q15_from_db(MASTER_GAIN_DB);
-extern int16_t masterGainQ15;
+extern int32_t masterGainQ15;

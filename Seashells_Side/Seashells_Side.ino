@@ -24,7 +24,7 @@
 #include "OtaUpdate.h"
 
 // Master trim for this side (in dB). Use 0 for unity, negatives to reduce.
-#define MASTER_GAIN_DB 0
+#define MASTER_GAIN_DB -20
 
 // ======= RGB setup =======
 #define NUM_LEDS_PER  1
@@ -250,7 +250,7 @@ void side_setScene(uint16_t ids[4]) {
     }
 
     // Compute per-clip gain: master * per-clip (dB -> Q15)
-    int16_t clipQ = q15_from_db(cm->volume_db);
+    int32_t clipQ = q15_from_db(cm->volume_db);
     ch[i].gainQ15 = q15_mul(masterGainQ15, clipQ);
 
     // If this is a synthetic tone, configure tone channel and skip SD

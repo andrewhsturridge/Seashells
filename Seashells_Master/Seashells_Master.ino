@@ -49,9 +49,9 @@
 
 // ---------- Tuning ----------
 static const uint32_t BASE_TIMEOUT_MS[3] = {
-  30000,  // Round 1 base: 30s
-  25000,  // Round 2 base: 25s
-  20000   // Round 3 base: 20s
+  45000,  // Round 1 base: 45s
+  40000,  // Round 2 base: 40s
+  35000   // Round 3 base: 35s
 };
 static const float   TIME_DECAY_FACTOR = 0.8f;   // each correct: timeout *= 0.8
 static const uint32_t MIN_TIMEOUT_MS   = 5000;   // never go below 5 seconds

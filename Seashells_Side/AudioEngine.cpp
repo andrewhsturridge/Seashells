@@ -618,23 +618,47 @@ void i2s_init_common(i2s_port_t port, int dout, int bclk, int lrck) {
 }
 
 // ───────────────── Volume helpers ─────────────────
+//
+// IMPORTANT:
+// - Gains are stored as *int32 Q15* with 1.0 == 32768 (not 32767).
+// - This allows per-clip `volume_db` in the manifest to BOOST above 0 dB.
+// - Samples are still 16-bit; we saturate after gain is applied.
+//
+// Suggested bounds: keep per-clip volume_db within roughly [-40, +36].
+// Going higher will usually just hard-clip.
 
-int16_t q15_from_db(int8_t db) {
-  float g = powf(10.0f, db / 20.0f);
-  int32_t q = (int32_t)(g * 32767.0f + 0.5f);
-  if (q < 0) q = 0; if (q > 32767) q = 32767;
-  return (int16_t)q;
+static constexpr int8_t kMaxBoostDb = 36;  // clamp positive dB to keep numbers sane
+
+int32_t q15_from_db(int8_t db) {
+  if (db > kMaxBoostDb) db = kMaxBoostDb;
+  // Convert dB to linear gain.
+  float g = powf(10.0f, ((float)db) / 20.0f);
+  // Q15 where 1.0 == 32768, so unity is exact when we shift by 15.
+  int32_t q = (int32_t)(g * 32768.0f + 0.5f);
+  if (q < 0) q = 0;
+  return q;
 }
-int16_t q15_mul(int16_t a, int16_t b) {
-  int32_t t = (int32_t)a * (int32_t)b;
+
+int32_t q15_mul(int32_t a, int32_t b) {
+  // Q15 * Q15 => Q30, then shift back to Q15
+  int64_t t = (int64_t)a * (int64_t)b;
   t >>= 15;
-  if (t >  32767) t =  32767;
-  if (t < -32768) t = -32768;
-  return (int16_t)t;
-}
-void applyGain(int16_t* buf, size_t n, int16_t g) {
-  if (g == 32767) return; // unity
-  for (size_t i=0; i<n; i++) buf[i] = q15_mul(buf[i], g);
+  if (t < 0) t = 0;
+  if (t > 0x7fffffffLL) t = 0x7fffffffLL;
+  return (int32_t)t;
 }
 
-int16_t masterGainQ15 = q15_from_db(0);
+void applyGain(int16_t* buf, size_t n, int32_t g) {
+  if (g == 32768) return; // unity
+  for (size_t i=0; i<n; i++) {
+    int64_t t = (int64_t)buf[i] * (int64_t)g;
+    t >>= 15;
+    if (t >  32767) t =  32767;
+    if (t < -32768) t = -32768;
+    buf[i] = (int16_t)t;
+  }
+}
+
+// Default to 0 dB; set this from your .ino at startup:
+//   masterGainQ15 = q15_from_db(MASTER_GAIN_DB);
+int32_t masterGainQ15 = q15_from_db(0);
