@@ -24,7 +24,7 @@
 #include "OtaUpdate.h"
 
 // Master trim for this side (in dB). Use 0 for unity, negatives to reduce.
-#define MASTER_GAIN_DB -20
+#define MASTER_GAIN_DB 0
 
 // ======= RGB setup =======
 #define NUM_LEDS_PER  1
@@ -425,6 +425,7 @@ void setup() {
 // ======= Main loop =======
 void loop() {
   Ota_loopTick();
+  GameBus_pump();  // process queued ESP-NOW commands in the main loop (avoids LED glitches)
 
   uint32_t now = millis();
   for (int i=0;i<4;++i) {

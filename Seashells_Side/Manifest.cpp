@@ -43,6 +43,9 @@ bool Manifest_load() {
     // Skip header line if present
     if (line.startsWith("id,")) continue;
 
+    // Skip separator/blank rows like ',,,,,,,,' (ID must start with a digit)
+    if (!isDigit(line[0])) continue;
+
     // Expected format:
     // id,pool,path,precache,volume_db,base,sub,sub2,tags
     int c1 = line.indexOf(',');              if (c1 < 0) continue;
@@ -65,6 +68,7 @@ bool Manifest_load() {
 
     // Field 2: path
     m.path = line.substring(c2 + 1, c3);
+    m.path.trim();
 
     // Field 3: precache (0/1)
     m.precache = (line.substring(c3 + 1, c4).toInt() != 0);
@@ -74,16 +78,22 @@ bool Manifest_load() {
 
     // Field 5: base
     m.base = line.substring(c5 + 1, c6);
+    m.base.trim();
 
     // Field 6: sub
     m.sub = line.substring(c6 + 1, c7);
+    m.sub.trim();
 
     // Field 7: sub2
     m.sub2 = line.substring(c7 + 1, c8);
+    m.sub2.trim();
 
     // Field 8: tags
     m.tags = line.substring(c8 + 1);
     m.tags.trim();
+
+    // Reserve ID=0 as "no clip" (used to clear slots)
+    if (m.id == 0) continue;
 
     if (catalogCount < MAX_CLIPS) {
       catalog[catalogCount++] = m;

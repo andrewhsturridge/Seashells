@@ -8,6 +8,7 @@
 
 void GameBus_init();
 void GameBus_deinit();
+void GameBus_pump();  // call this from loop() to process queued ESP-NOW commands
 void GameBus_sendHello(uint16_t poolA_count, uint16_t poolB_count);
 void GameBus_sendBtnEvent(uint8_t slotIdx);
 void GameBus_sendOtaStatus(uint8_t code);

@@ -1,4 +1,4 @@
-#include <cstring> 
+#include <cstring>
 #include <esp_now.h>
 
 #include "GameBusSide.h"
@@ -14,8 +14,65 @@ extern void side_blinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms);
 extern void side_setGameMode(bool en);
 extern void side_startLoopAll();
 extern void side_stopAll();
-extern void side_ledAllWhite();
-extern void side_blinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMPORTANT: ESP-NOW receive callbacks run in the WiFi task context.
+// Doing SD I/O, NeoPixel .show(), or other heavy work inside the callback can
+// cause random glitches (including missed LED updates).
+//
+// Fix: queue inbound commands in the callback, then process them in the main
+// Arduino loop via GameBus_pump().
+// ─────────────────────────────────────────────────────────────────────────────
+
+static constexpr uint8_t kCmdQSize      = 16;
+static constexpr uint8_t kCmdMaxPayload = 210; // enough for OTA url packets
+
+struct CmdMsg {
+  uint8_t type = 0;
+  uint8_t len  = 0;
+  uint8_t payload[kCmdMaxPayload];
+};
+
+static CmdMsg cmdQ[kCmdQSize];
+static volatile uint8_t qHead = 0;
+static volatile uint8_t qTail = 0;
+static portMUX_TYPE qMux = portMUX_INITIALIZER_UNLOCKED;
+
+static inline void qPush(uint8_t type, const uint8_t* payload, uint8_t len) {
+  if (len > kCmdMaxPayload) len = kCmdMaxPayload;
+
+  portENTER_CRITICAL(&qMux);
+  uint8_t next = (uint8_t)((qHead + 1) % kCmdQSize);
+
+  // If full, drop the oldest entry (keeps newest state like SET_SCENE)
+  if (next == qTail) {
+    qTail = (uint8_t)((qTail + 1) % kCmdQSize);
+  }
+
+  cmdQ[qHead].type = type;
+  cmdQ[qHead].len  = len;
+  if (len && payload) {
+    memcpy(cmdQ[qHead].payload, payload, len);
+  }
+  qHead = next;
+  portEXIT_CRITICAL(&qMux);
+}
+
+static inline bool qPop(CmdMsg& out) {
+  portENTER_CRITICAL(&qMux);
+  if (qTail == qHead) {
+    portEXIT_CRITICAL(&qMux);
+    return false;
+  }
+
+  out.type = cmdQ[qTail].type;
+  out.len  = cmdQ[qTail].len;
+  if (out.len) memcpy(out.payload, cmdQ[qTail].payload, out.len);
+
+  qTail = (uint8_t)((qTail + 1) % kCmdQSize);
+  portEXIT_CRITICAL(&qMux);
+  return true;
+}
 
 void GameBus_sendOtaStatus(uint8_t code) {
   uint8_t sid = (Role::get()==0xFF) ? 255 : Role::get();   // 255 = UNASSIGNED
@@ -33,78 +90,16 @@ void GameBus_sendOtaProgress(uint8_t percent) {
 static void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (!info || !data || len < 1) return;
 
-  // 1) ONLY accept packets from Master
+  // ONLY accept packets from Master
   if (std::memcmp(info->src_addr, MASTER_MAC, 6) != 0) {
     return;
   }
 
   const uint8_t type = data[0];
+  const uint8_t plen = (len > 1) ? (uint8_t)min(len - 1, (int)kCmdMaxPayload) : 0;
 
-  switch (type) {
-    case SET_SCENE: {
-      if (len < 1 + 8) return;
-      uint16_t ids[4];
-      for (int i = 0; i < 4; i++) {
-        ids[i] = (uint16_t)data[1 + i*2] << 8 | data[2 + i*2];
-      }
-      GB_onSetScene(ids);
-    } break;
-
-    case REQUEST_RANDOM_SET: {
-      if (len < 3) return;
-      GB_onRequestRandom(data[1], data[2]);
-    } break;
-
-    case PLAY_SLOT: {
-      if (len < 2) return;
-      GB_onPlaySlot(data[1] & 3);
-    } break;
-
-    case LED_ALL_WHITE: {
-      GB_onLedAllWhite();
-    } break;
-
-    case BLINK_ALL: {
-      if (len < 6) return;
-      uint8_t  color  = data[1];
-      uint16_t on_ms  = ((uint16_t)data[2] << 8) | data[3];
-      uint16_t off_ms = ((uint16_t)data[4] << 8) | data[5];
-      GB_onBlinkAll(color, on_ms, off_ms);
-    } break;
-
-    case GAME_MODE: {
-      if (len < 2) return;
-      GB_onGameMode(data[1] != 0);
-    } break;
-
-    case START_LOOP_ALL: {
-      GB_onStartLoopAll();
-    } break;
-
-    case STOP_ALL: {
-      GB_onStopAll();
-    } break;
-
-    case ROLE_ASSIGN: {
-      if (len < 2) return;
-      uint8_t newId = data[1] & 1;          // 0=A, 1=B
-      Serial.printf("[SIDE] ROLE_ASSIGN %u\n", newId);
-      Role::set(newId, /*persist*/true);
-    } break;
-    
-    case OTA_UPDATE: {
-      if (len < 2) return;
-      uint8_t ulen = data[1];
-      if (ulen == 0 || (int)ulen > len - 2) return;
-
-      side_setOtaUrl((const char*)(data+2), ulen);
-      side_requestOtaStart();
-      return;
-    }
-
-    default:
-      break;
-  }
+  // Queue payload bytes (everything after the type)
+  qPush(type, (plen ? (data + 1) : nullptr), plen);
 }
 
 void GameBus_init() {
@@ -139,10 +134,81 @@ void GameBus_sendBtnEvent(uint8_t slotIdx) {
   esp_now_send(MASTER_MAC, pkt, sizeof(pkt));
 }
 
+// Pump queued commands from the Arduino loop (safe context)
+void GameBus_pump() {
+  CmdMsg m;
+  while (qPop(m)) {
+    switch (m.type) {
+      case SET_SCENE: {
+        if (m.len < 8) break;
+        uint16_t ids[4];
+        for (int i = 0; i < 4; i++) {
+          ids[i] = (uint16_t)m.payload[i*2] << 8 | m.payload[i*2 + 1];
+        }
+        GB_onSetScene(ids);
+      } break;
+
+      case REQUEST_RANDOM_SET: {
+        if (m.len < 2) break;
+        GB_onRequestRandom(m.payload[0], m.payload[1]);
+      } break;
+
+      case PLAY_SLOT: {
+        if (m.len < 1) break;
+        GB_onPlaySlot(m.payload[0] & 3);
+      } break;
+
+      case LED_ALL_WHITE: {
+        GB_onLedAllWhite();
+      } break;
+
+      case BLINK_ALL: {
+        if (m.len < 5) break;
+        uint8_t  color  = m.payload[0];
+        uint16_t on_ms  = ((uint16_t)m.payload[1] << 8) | m.payload[2];
+        uint16_t off_ms = ((uint16_t)m.payload[3] << 8) | m.payload[4];
+        GB_onBlinkAll(color, on_ms, off_ms);
+      } break;
+
+      case GAME_MODE: {
+        if (m.len < 1) break;
+        GB_onGameMode(m.payload[0] != 0);
+      } break;
+
+      case START_LOOP_ALL: {
+        GB_onStartLoopAll();
+      } break;
+
+      case STOP_ALL: {
+        GB_onStopAll();
+      } break;
+
+      case ROLE_ASSIGN: {
+        if (m.len < 1) break;
+        uint8_t newId = m.payload[0] & 1;          // 0=A, 1=B
+        Serial.printf("[SIDE] ROLE_ASSIGN %u\n", newId);
+        Role::set(newId, /*persist*/true);
+      } break;
+
+      case OTA_UPDATE: {
+        if (m.len < 1) break;
+        uint8_t ulen = m.payload[0];
+        if (ulen == 0) break;
+        if (ulen > (uint8_t)(m.len - 1)) break;
+        side_setOtaUrl((const char*)(m.payload + 1), ulen);
+        side_requestOtaStart();
+      } break;
+
+      default:
+        break;
+    }
+  }
+}
+
 // Default mappings to the .ino functions
-void GB_onSetScene(uint16_t ids[4]) { 
+void GB_onSetScene(uint16_t ids[4]) {
   side_ledAllWhite();
-  side_setScene(ids); 
+  side_setScene(ids);
 }
 
 // NEW: category-based random selection for proof-of-concept
