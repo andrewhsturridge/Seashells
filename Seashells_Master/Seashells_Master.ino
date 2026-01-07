@@ -1,42 +1,45 @@
 /*
-  Seashells Master – Odd One Out with Rounds -> Levels 1/2/3 + unique-first + lives + shrinking timeout
-  - Master holds its own manifest in flash (MasterManifest)
-  - Master chooses all 8 IDs per round
-  - Sides just receive SET_SCENE and play
-
-  Rounds:
-    Round 1 (roundIdx = 0): Level 1
-      -> 7 from one sub2 of a random base, 1 from a different base
-    Round 2 (roundIdx = 1): Level 2
-      -> 7 from a random base, 1 from a different base
-    Round 3 (roundIdx = 2): Level 3
-      -> 7 from one sub of a random base, 1 from a different sub of same base
-      -> Round 3 is infinite: you never "clear" it by points, only by running out of lives.
-
-  Unique-first rule:
-    For the "same 7", we:
-      - Use as many distinct IDs as available in the chosen bucket
-      - If fewer than 7 exist, reuse from those unique ones to fill the rest
-
-  Lives:
-    - Start each game with 5 lives.
-    - On wrong pick or timeout:
-        lives--.
-        If lives > 0 -> red blink, then continue with a new BUILD in the same round.
-        If lives == 0 -> red blink, then game over (IDLE).
-
-  Timeout:
-    - Each round has a base timeout.
-    - At the start of each round, curTimeoutMs = baseTimeout for that round.
-    - After each correct point, curTimeoutMs decays (speeds up).
-    - Wrong picks/timeouts do NOT change the timeout; they only cost lives.
-
-  Serial:
-    's' => start game (resets lives, points, round, timeout)
-    'e' => end game
-    'u','a','b' => OTA triggers (unchanged)
+// =============================================================
+// Seashells Master (Odd One Out) — ESP-NOW Controller
+//
+// With standardized serial protocol for the main Player Management System (PMS)
+//
+// Standard protocol lines always start with:
+//   !PMS
+//
+// PMS protocol (v1) ***DO NOT REMOVE***:
+//
+//   PMS -> Master:
+//     !PMS PING
+//     !PMS START level=1        (level 1..3; default 1)
+//     !PMS STOP
+//
+//   Master -> PMS:
+//     !PMS PONG v=1 game=seashells role=server
+//     !PMS STATUS v=1 state=arming|playing level=1|2|3 score=.. lives=.. tleft_ms=.. last_reason=..
+//       (STATUS prints every 250ms while active; NOT emitted while idle)
+//     !PMS EVENT v=1 name=game_start level=1
+//     !PMS EVENT v=1 name=game_end reason=timeup|no_lives|stopped score=.. lives=..
+//     !PMS EVENT v=1 name=score delta=1 total=.. bonus=0
+//     !PMS EVENT v=1 name=life delta=-1 lives=..
+//
+// Notes:
+//   - One message per line, newline '\n' terminated.
+//   - PMS should ONLY parse lines starting with "!PMS" (ignore everything else).
+//   - No ACK/ERR by design (PMS infers success from STATUS/EVENT).
+//
+// Legacy serial (for manual tech/debug use):
+//   - This sketch used to react to single incoming characters ('s','e','u','a','b').
+//   - To prevent accidental triggers from PMS traffic (e.g., the 'e' in "level="),
+//     legacy commands are now line-based:
+//       "s" = start, "e" = end, "u" = OTA both, "a" = OTA side A, "b" = OTA side B
+//
+// Build toggles (compile-time):
+//   - PMS_STD_ENABLED: enable/disable PMS protocol support
+//   - PMS_DEBUG_SERIAL: when 0, suppress non-!PMS debug/legacy Serial prints (clean PMS output)
+//
+// =============================================================
 */
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -46,6 +49,36 @@
 #include "Messages.h"
 #include "ConfigMaster.h"
 #include "MasterManifest.h"
+
+// =============================================================
+// PMS / Debug toggles
+// =============================================================
+
+#ifndef PMS_STD_ENABLED
+#define PMS_STD_ENABLED 1
+#endif
+
+// 1 = Keep legacy/debug Serial prints (boot banners, manifest dump, debug logs)
+// 0 = Suppress all non-!PMS output (recommended for production PMS wiring)
+#ifndef PMS_DEBUG_SERIAL
+#define PMS_DEBUG_SERIAL 1
+#endif
+
+// PMS STATUS tick period (ms)
+#ifndef PMS_STATUS_PERIOD_MS
+#define PMS_STATUS_PERIOD_MS 250
+#endif
+
+#if PMS_DEBUG_SERIAL
+  #define DBG_PRINT(...)    Serial.print(__VA_ARGS__)
+  #define DBG_PRINTLN(...)  Serial.println(__VA_ARGS__)
+  #define DBG_PRINTF(...)   Serial.printf(__VA_ARGS__)
+#else
+  #define DBG_PRINT(...)    do { } while (0)
+  #define DBG_PRINTLN(...)  do { } while (0)
+  #define DBG_PRINTF(...)   do { } while (0)
+#endif
+
 
 // ---------- Tuning ----------
 static const uint32_t BASE_TIMEOUT_MS[3] = {
@@ -81,6 +114,364 @@ static uint16_t sceneA[4] {0,0,0,0};
 static uint16_t sceneB[4] {0,0,0,0};
 static bool     slotIsOdd_A[4] {false,false,false,false};
 static bool     slotIsOdd_B[4] {false,false,false,false};
+
+// =============================================================
+// Game session bookkeeping (moved out of loop so PMS status can read it)
+// =============================================================
+
+// Round/level state:
+//   roundIdx 0 => Level 1
+//   roundIdx 1 => Level 2
+//   roundIdx 2 => Level 3 (infinite)
+static uint8_t  g_roundIdx       = 0;
+static uint8_t  g_pointsInRound  = 0;      // resets every 3 correct picks
+static uint16_t g_scoreTotal     = 0;      // total correct selections this session (PMS score)
+static uint8_t  g_lives          = MAX_LIVES;
+
+static uint32_t g_waitStartMs    = 0;      // when WAIT began (for timeout countdown)
+static uint32_t g_curTimeoutMs   = BASE_TIMEOUT_MS[0];
+
+// =============================================================
+// PMS status/event bookkeeping
+// =============================================================
+
+enum PmsState : uint8_t { PMS_IDLE = 0, PMS_ARMING = 1, PMS_PLAYING = 2 };
+
+static uint32_t g_pmsLastTickMs   = 0;
+static PmsState g_pmsLastState    = PMS_IDLE;
+static const char* g_pmsLastReason = "none";  // none|score|life|state|stale (stale unused here)
+
+static bool g_pmsGameStarted      = false;
+static bool g_pmsGameEndEmitted   = false;
+
+// Serial line buffering (prevents accidental triggers from PMS traffic)
+static String g_serialLine;
+
+
+// Forward declarations for commands defined later in this file
+static void cmdLedAllWhite();
+static void cmdStopAll();
+static void cmdOtaUpdate(const uint8_t mac[6], const char* url);
+
+// =============================================================
+// PMS helpers
+// =============================================================
+
+static uint8_t seashellsLevelFromRoundIdx(uint8_t roundIdx) {
+  return (roundIdx < 2) ? (uint8_t)(roundIdx + 1) : 3;
+}
+
+static const char* pmsStateStr(PmsState st) {
+  switch (st) {
+    case PMS_ARMING:  return "arming";
+    case PMS_PLAYING: return "playing";
+    default:          return "unknown";
+  }
+}
+
+static void pmsPrintPong() {
+#if PMS_STD_ENABLED
+  Serial.println(F("!PMS PONG v=1 game=seashells role=server"));
+#endif
+}
+
+static void pmsPrintEventGameStart(uint8_t level) {
+#if PMS_STD_ENABLED
+  Serial.print(F("!PMS EVENT v=1 name=game_start level="));
+  Serial.println(level);
+#endif
+}
+
+static void pmsPrintEventGameEnd(const char* reason, uint16_t score, uint8_t lives) {
+#if PMS_STD_ENABLED
+  Serial.print(F("!PMS EVENT v=1 name=game_end reason="));
+  Serial.print(reason);
+  Serial.print(F(" score="));
+  Serial.print(score);
+  Serial.print(F(" lives="));
+  Serial.println(lives);
+#endif
+}
+
+static void pmsPrintEventScore(int32_t delta, uint16_t total) {
+#if PMS_STD_ENABLED
+  Serial.print(F("!PMS EVENT v=1 name=score delta="));
+  Serial.print(delta);
+  Serial.print(F(" total="));
+  Serial.print(total);
+  Serial.println(F(" bonus=0"));
+#endif
+}
+
+static void pmsPrintEventLife(int32_t delta, uint8_t lives) {
+#if PMS_STD_ENABLED
+  Serial.print(F("!PMS EVENT v=1 name=life delta="));
+  Serial.print(delta);
+  Serial.print(F(" lives="));
+  Serial.println(lives);
+#endif
+}
+
+static void pmsPrintStatus(PmsState st, uint8_t level, uint16_t score, uint8_t lives, uint32_t tleftMs, const char* lastReason) {
+#if PMS_STD_ENABLED
+  Serial.print(F("!PMS STATUS v=1 state="));
+  Serial.print(pmsStateStr(st));
+  Serial.print(F(" level="));
+  Serial.print(level);
+  Serial.print(F(" score="));
+  Serial.print(score);
+  Serial.print(F(" lives="));
+  Serial.print(lives);
+  Serial.print(F(" tleft_ms="));
+  Serial.print(tleftMs);
+  Serial.print(F(" last_reason="));
+  Serial.println(lastReason);
+#endif
+}
+
+// Emit game_end at most once per session
+static void pmsMaybeEmitGameEnd(const char* reason) {
+#if PMS_STD_ENABLED
+  if (g_pmsGameStarted && !g_pmsGameEndEmitted) {
+    pmsPrintEventGameEnd(reason, g_scoreTotal, g_lives);
+    g_pmsGameEndEmitted = true;
+  }
+#else
+  (void)reason;
+#endif
+}
+
+// =============================================================
+// Game start/stop helpers (used by both PMS and legacy serial)
+// =============================================================
+
+static void startGameAtLevel(uint8_t level) {
+  if (level < 1) level = 1;
+  if (level > 3) level = 3;
+
+  // Reset session state
+  g_lives         = MAX_LIVES;
+  g_scoreTotal    = 0;
+  g_pointsInRound = 0;
+  g_roundIdx      = (uint8_t)(level - 1);
+  g_curTimeoutMs  = BASE_TIMEOUT_MS[g_roundIdx];
+  g_waitStartMs   = 0;
+
+  // Clear pick latch
+  lastSide = lastSlot = 255;
+
+  // Enter active state machine
+  cmdLedAllWhite();
+  g_state = BUILD;
+
+  DBG_PRINTF("Game start (level=%u, lives=%u, timeout=%lums)\n",
+             (unsigned)level, (unsigned)g_lives, (unsigned long)g_curTimeoutMs);
+
+  // PMS bookkeeping
+  g_pmsGameStarted    = true;
+  g_pmsGameEndEmitted = false;
+  g_pmsLastReason     = "state";
+  pmsPrintEventGameStart(level);
+}
+
+static void stopGameFromHost(const char* reason) {
+  if (g_state == IDLE) return;
+
+  cmdStopAll();
+  g_state = IDLE;
+  DBG_PRINTLN("[Master] Game ended -> IDLE");
+
+  g_pmsLastReason = "state";
+  pmsMaybeEmitGameEnd(reason);
+}
+
+// =============================================================
+// Serial parsing (PMS + legacy)
+// =============================================================
+
+static int32_t parseKeyInt(const String& line, const char* key, int32_t defaultVal) {
+  String pattern = String(key) + "=";
+  int idx = line.indexOf(pattern);
+  if (idx < 0) return defaultVal;
+
+  idx += pattern.length();
+  int end = idx;
+  while (end < (int)line.length()) {
+    char c = line.charAt(end);
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') break;
+    end++;
+  }
+  String val = line.substring(idx, end);
+  val.trim();
+  if (val.length() == 0) return defaultVal;
+  return val.toInt();
+}
+
+static String firstToken(const String& s) {
+  int sp = s.indexOf(' ');
+  if (sp < 0) return s;
+  return s.substring(0, sp);
+}
+
+static String afterFirstToken(const String& s) {
+  int sp = s.indexOf(' ');
+  if (sp < 0) return "";
+  return s.substring(sp + 1);
+}
+
+static void handlePmsLine(const String& rawLine) {
+#if PMS_STD_ENABLED
+  String line = rawLine;
+  line.trim();
+  if (!line.startsWith("!PMS")) return;
+
+  String rest = line.substring(4);
+  rest.trim();
+  if (rest.length() == 0) return;
+
+  String cmd = firstToken(rest);
+  String args = afterFirstToken(rest);
+  cmd.toUpperCase();
+
+  if (cmd == "PING") {
+    pmsPrintPong();
+    return;
+  }
+
+  if (cmd == "START") {
+    int32_t level = parseKeyInt(args, "level", 1);
+    startGameAtLevel((uint8_t)level);
+    return;
+  }
+
+  if (cmd == "STOP") {
+    stopGameFromHost("stopped");
+    return;
+  }
+
+  DBG_PRINT("Unknown PMS cmd: ");
+  DBG_PRINTLN(rawLine);
+#else
+  (void)rawLine;
+#endif
+}
+
+static void handleLegacyLine(const String& rawLine) {
+  String line = rawLine;
+  line.trim();
+  if (line.length() == 0) return;
+
+  // Legacy commands are line-based to avoid accidental triggers from PMS traffic.
+  if (line.length() == 1) {
+    char c = line.charAt(0);
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+
+    if (c == 's') {
+      startGameAtLevel(1);
+      return;
+    }
+    if (c == 'e') {
+      stopGameFromHost("stopped");
+      return;
+    }
+    if (c == 'u') {
+      DBG_PRINTLN("[Master] OTA both sides");
+      cmdOtaUpdate(SIDE_A_MAC, OTA_URL_SIDE_BIN);
+      delay(200);
+      cmdOtaUpdate(SIDE_B_MAC, OTA_URL_SIDE_BIN);
+      return;
+    }
+    if (c == 'a') {
+      cmdOtaUpdate(SIDE_A_MAC, OTA_URL_SIDE_BIN);
+      return;
+    }
+    if (c == 'b') {
+      cmdOtaUpdate(SIDE_B_MAC, OTA_URL_SIDE_BIN);
+      return;
+    }
+  }
+
+  // Unknown legacy input: stay quiet in production
+  DBG_PRINT("Unknown legacy line: ");
+  DBG_PRINTLN(rawLine);
+}
+
+static void handleSerialLine(const String& rawLine) {
+  String line = rawLine;
+  line.trim();
+  if (line.length() == 0) return;
+
+#if PMS_STD_ENABLED
+  if (line.startsWith("!PMS")) {
+    handlePmsLine(line);
+    return;
+  }
+#endif
+  handleLegacyLine(line);
+}
+
+static void pollSerial() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      handleSerialLine(g_serialLine);
+      g_serialLine = "";
+    } else {
+      // Avoid unbounded growth if someone blasts data without newlines
+      if (g_serialLine.length() < 256) g_serialLine += c;
+    }
+  }
+}
+
+// =============================================================
+// PMS 250ms STATUS tick (suppressed while idle)
+// =============================================================
+
+static void pmsTick() {
+#if PMS_STD_ENABLED
+  const uint32_t now = millis();
+  if (now - g_pmsLastTickMs < (uint32_t)PMS_STATUS_PERIOD_MS) return;
+  g_pmsLastTickMs = now;
+
+  // No STATUS while idle.
+  if (g_state == IDLE) {
+    // If we somehow returned to idle without emitting game_end, emit a safe fallback.
+    if (g_pmsGameStarted && !g_pmsGameEndEmitted) {
+      pmsMaybeEmitGameEnd("stopped");
+    }
+    g_pmsLastState = PMS_IDLE;
+    return;
+  }
+
+  const PmsState curState = (g_state == WAIT) ? PMS_PLAYING : PMS_ARMING;
+
+  // Default tleft_ms is meaningful only during WAIT (selection timer)
+  uint32_t tleftMs = 0;
+  if (curState == PMS_PLAYING && g_curTimeoutMs > 0) {
+    uint32_t elapsed = now - g_waitStartMs;
+    tleftMs = (elapsed >= g_curTimeoutMs) ? 0 : (g_curTimeoutMs - elapsed);
+  }
+
+  const uint8_t level = seashellsLevelFromRoundIdx(g_roundIdx);
+
+  // last_reason: prefer explicit score/life markers, else show state changes
+  const char* lr = g_pmsLastReason;
+  if (strcmp(lr, "none") == 0 && curState != g_pmsLastState) {
+    lr = "state";
+  }
+
+  pmsPrintStatus(curState, level, g_scoreTotal, g_lives, tleftMs, lr);
+
+  // reset one-shot reason after a tick
+  g_pmsLastReason = "none";
+  g_pmsLastState = curState;
+#else
+  (void)0;
+#endif
+}
+
+
 
 // ---------- ESP-NOW helpers ----------
 static void addPeer(const uint8_t mac[6]) {
@@ -154,7 +545,7 @@ static void cmdSetScene(const uint8_t mac[6], const uint16_t ids[4]){
 static void endGame() {
   cmdStopAll();
   g_state = IDLE;
-  Serial.println("[Master] Game ended -> IDLE");
+  DBG_PRINTLN("[Master] Game ended -> IDLE");
 }
 
 static void shuffleArray(uint16_t* arr, size_t n) {
@@ -169,9 +560,9 @@ static void shuffleArray(uint16_t* arr, size_t n) {
 static void printIdInfo(const char* label, uint16_t id) {
   const MasterClipMeta* cm = MasterManifest_find(id);
   if (!cm) {
-    Serial.printf("  %s id=%u (unknown)\n", label, (unsigned)id);
+    DBG_PRINTF("  %s id=%u (unknown)\n", label, (unsigned)id);
   } else {
-    Serial.printf("  %s id=%u base=%s sub=%s sub2=%s\n",
+    DBG_PRINTF("  %s id=%u base=%s sub=%s sub2=%s\n",
                   label, (unsigned)id, cm->base, cm->sub, cm->sub2);
   }
 }
@@ -279,7 +670,7 @@ static uint16_t pickRandomIdByBase(const char* base) {
 static void fillWithUniqueThenReuse(uint16_t* dest, size_t needed, uint16_t* uniqueIds, size_t uniqueCount, const char* context) {
   if (uniqueCount == 0) {
     for (size_t i=0; i<needed; i++) dest[i] = 0;
-    Serial.printf("[Master] WARN: no IDs for context '%s'\n", context ? context : "");
+    DBG_PRINTF("[Master] WARN: no IDs for context '%s'\n", context ? context : "");
     return;
   }
 
@@ -303,7 +694,7 @@ static void buildScenes_level2_randomBases() {
   size_t baseCount = collectUniqueBases(bases, 8);
 
   if (baseCount < 2) {
-    Serial.println("[Master] Level2: need >=2 bases, falling back to trivial (all from same base)");
+    DBG_PRINTLN("[Master] Level2: need >=2 bases, falling back to trivial (all from same base)");
     baseCount = collectUniqueBases(bases, 8);
   }
 
@@ -319,7 +710,7 @@ static void buildScenes_level2_randomBases() {
 
   size_t uCount = collectIdsByBase(baseMain, unique, 32);
   if (uCount == 0) {
-    Serial.println("[Master] Level2: no IDs for baseMain, using any IDs");
+    DBG_PRINTLN("[Master] Level2: no IDs for baseMain, using any IDs");
     for (int i=0;i<7;i++) sameIds[i] = MASTER_CLIPS[random((long)MASTER_CLIP_COUNT)].id;
   } else {
     fillWithUniqueThenReuse(sameIds, 7, unique, uCount, "Level2 baseMain");
@@ -356,7 +747,7 @@ static void buildScenes_level2_randomBases() {
   for (int i=0;i<4;i++) slotIsOdd_A[i] = (sceneA[i] == oddId);
   for (int i=0;i<4;i++) slotIsOdd_B[i] = (sceneB[i] == oddId);
 
-  Serial.printf("[Master] Level2: baseMain=%s baseOdd=%s sideOdd=%u oddSlot=%u\n",
+  DBG_PRINTF("[Master] Level2: baseMain=%s baseOdd=%s sideOdd=%u oddSlot=%u\n",
                 baseMain, baseOdd, (unsigned)sideOdd, (unsigned)oddSlot);
   for (int i=0;i<4;i++) printIdInfo("  sceneA", sceneA[i]);
   for (int i=0;i<4;i++) printIdInfo("  sceneB", sceneB[i]);
@@ -367,7 +758,7 @@ static void buildScenes_level1_sub2() {
   const char* bases[8];
   size_t baseCount = collectUniqueBases(bases, 8);
   if (baseCount < 2) {
-    Serial.println("[Master] Level1: need >=2 bases, fallback to Level2");
+    DBG_PRINTLN("[Master] Level1: need >=2 bases, fallback to Level2");
     buildScenes_level2_randomBases();
     return;
   }
@@ -378,7 +769,7 @@ static void buildScenes_level1_sub2() {
   const char* sub2List[16];
   size_t sub2Count = collectUniqueSub2ForBase(baseMain, sub2List, 16);
   if (sub2Count == 0) {
-    Serial.println("[Master] Level1: no sub2 families for baseMain, fallback to Level2");
+    DBG_PRINTLN("[Master] Level1: no sub2 families for baseMain, fallback to Level2");
     buildScenes_level2_randomBases();
     return;
   }
@@ -395,7 +786,7 @@ static void buildScenes_level1_sub2() {
 
   size_t uCount = collectIdsByBaseSub2(baseMain, familySub2, unique, 32);
   if (uCount == 0) {
-    Serial.println("[Master] Level1: no IDs for baseMain+sub2, fallback to Level2");
+    DBG_PRINTLN("[Master] Level1: no IDs for baseMain+sub2, fallback to Level2");
     buildScenes_level2_randomBases();
     return;
   }
@@ -432,7 +823,7 @@ static void buildScenes_level1_sub2() {
   for (int i=0;i<4;i++) slotIsOdd_A[i] = (sceneA[i] == oddId);
   for (int i=0;i<4;i++) slotIsOdd_B[i] = (sceneB[i] == oddId);
 
-  Serial.printf("[Master] Level1: baseMain=%s familySub2=%s baseOdd=%s sideOdd=%u oddSlot=%u\n",
+  DBG_PRINTF("[Master] Level1: baseMain=%s familySub2=%s baseOdd=%s sideOdd=%u oddSlot=%u\n",
                 baseMain, familySub2, baseOdd, (unsigned)sideOdd, (unsigned)oddSlot);
   for (int i=0;i<4;i++) printIdInfo("  sceneA", sceneA[i]);
   for (int i=0;i<4;i++) printIdInfo("  sceneB", sceneB[i]);
@@ -443,7 +834,7 @@ static void buildScenes_level3_subs() {
   const char* bases[8];
   size_t baseCount = collectUniqueBases(bases, 8);
   if (baseCount == 0) {
-    Serial.println("[Master] Level3: no bases, fallback to Level2");
+    DBG_PRINTLN("[Master] Level3: no bases, fallback to Level2");
     buildScenes_level2_randomBases();
     return;
   }
@@ -463,7 +854,7 @@ static void buildScenes_level3_subs() {
   }
 
   if (!baseMain || subCount < 2) {
-    Serial.println("[Master] Level3: no base with >=2 subs, fallback to Level2");
+    DBG_PRINTLN("[Master] Level3: no base with >=2 subs, fallback to Level2");
     buildScenes_level2_randomBases();
     return;
   }
@@ -480,7 +871,7 @@ static void buildScenes_level3_subs() {
 
   size_t uCount = collectIdsByBaseSub(baseMain, subSame, unique, 32);
   if (uCount == 0) {
-    Serial.println("[Master] Level3: no IDs for baseMain+subSame, fallback to Level2");
+    DBG_PRINTLN("[Master] Level3: no IDs for baseMain+subSame, fallback to Level2");
     buildScenes_level2_randomBases();
     return;
   }
@@ -517,7 +908,7 @@ static void buildScenes_level3_subs() {
   for (int i=0;i<4;i++) slotIsOdd_A[i] = (sceneA[i] == oddId);
   for (int i=0;i<4;i++) slotIsOdd_B[i] = (sceneB[i] == oddId);
 
-  Serial.printf("[Master] Level3: baseMain=%s subSame=%s subOdd=%s sideOdd=%u oddSlot=%u\n",
+  DBG_PRINTF("[Master] Level3: baseMain=%s subSame=%s subOdd=%s sideOdd=%u oddSlot=%u\n",
                 baseMain, subSame, subOdd, (unsigned)sideOdd, (unsigned)oddSlot);
   for (int i=0;i<4;i++) printIdInfo("  sceneA", sceneA[i]);
   for (int i=0;i<4;i++) printIdInfo("  sceneB", sceneB[i]);
@@ -542,7 +933,7 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
   if (type == HELLO && len >= 6) {
     const uint8_t* mac = info->src_addr;
 
-    Serial.printf("[Master] HELLO from %s sideId=%u poolA=%u poolB=%u\n",
+    DBG_PRINTF("[Master] HELLO from %s sideId=%u poolA=%u poolB=%u\n",
                   isA ? "Side A" : "Side B",
                   data[1],
                   (uint16_t)(data[2] << 8 | data[3]),
@@ -563,7 +954,7 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
     if (len >= 3) {
       lastSide = data[1];
       lastSlot = data[2];
-      Serial.printf("[Master] BTN_EVENT side=%u slot=%u\n", lastSide, lastSlot);
+      DBG_PRINTF("[Master] BTN_EVENT side=%u slot=%u\n", lastSide, lastSlot);
     }
     return;
   }
@@ -574,7 +965,7 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
 
     if (code == OTA_STATUS_PROGRESS && len >= 4) {
       uint8_t pct = data[3];
-      Serial.printf("[Master] OTA %s: %3u%%\n", sideName, pct);
+      DBG_PRINTF("[Master] OTA %s: %3u%%\n", sideName, pct);
     } else {
       const char* msg =
         (code==OTA_STATUS_BEGIN)     ? "BEGIN" :
@@ -582,7 +973,7 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
         (code==OTA_STATUS_FAIL_WIFI) ? "FAIL_WIFI" :
         (code==OTA_STATUS_FAIL_HTTP) ? "FAIL_HTTP" :
         (code==OTA_STATUS_FAIL_UPD)  ? "FAIL_UPDATE" : "UNKNOWN";
-      Serial.printf("[Master] OTA %s: %s\n", sideName, msg);
+      DBG_PRINTF("[Master] OTA %s: %s\n", sideName, msg);
     }
     return;
   }
@@ -595,7 +986,7 @@ static void nowInit() {
   esp_wifi_set_promiscuous(false);
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("[NOW] init failed");
+    DBG_PRINTLN("[NOW] init failed");
     return;
   }
   esp_now_register_recv_cb(onRecv);
@@ -607,20 +998,20 @@ static void nowInit() {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("[Master] Odd One Out (Rounds 1/2/3 + unique-first + lives + shrinking timeout)");
+  DBG_PRINTLN("[Master] Odd One Out (Rounds 1/2/3 + unique-first + lives + shrinking timeout)");
 
   nowInit();
 
   uint8_t mac[6];
   esp_wifi_get_mac(WIFI_IF_STA, mac);
-  Serial.printf("Master STA MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+  DBG_PRINTF("Master STA MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
                 mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
 
   randomSeed(esp_timer_get_time());
 
-  Serial.println("[Master] Manifest summary:");
+  DBG_PRINTLN("[Master] Manifest summary:");
   for (size_t i=0; i<MASTER_CLIP_COUNT; i++) {
-    Serial.printf("  id=%u base=%s sub=%s sub2=%s\n",
+    DBG_PRINTF("  id=%u base=%s sub=%s sub2=%s\n",
                   (unsigned)MASTER_CLIPS[i].id,
                   MASTER_CLIPS[i].base,
                   MASTER_CLIPS[i].sub,
@@ -630,55 +1021,35 @@ void setup() {
   cmdGameMode(true);
 }
 
-void loop() {
-  static uint8_t roundIdx = 0, points = 0, lives = MAX_LIVES;
-  static uint32_t t0 = 0;
-  static uint32_t curTimeoutMs = BASE_TIMEOUT_MS[0];
 
-  if (Serial.available()) {
-    char c = Serial.read();
-    if (c=='s') {
-      lives = MAX_LIVES;
-      points = 0;
-      roundIdx = 0;
-      curTimeoutMs = BASE_TIMEOUT_MS[0];
-      Serial.printf("Game start (round 1, lives=%u, timeout=%lums)\n",
-                    (unsigned)lives, (unsigned long)curTimeoutMs);
-      cmdLedAllWhite();
-      g_state = BUILD;
-    }
-    else if (c=='e') { endGame(); }
-    else if (c=='u') {
-      Serial.println("[Master] OTA both sides");
-      cmdOtaUpdate(SIDE_A_MAC, OTA_URL_SIDE_BIN);
-      delay(200);
-      cmdOtaUpdate(SIDE_B_MAC, OTA_URL_SIDE_BIN);
-    }
-    else if (c=='a') { cmdOtaUpdate(SIDE_A_MAC, OTA_URL_SIDE_BIN); }
-    else if (c=='b') { cmdOtaUpdate(SIDE_B_MAC, OTA_URL_SIDE_BIN); }
-  }
+void loop() {
+  // Non-blocking serial processing (PMS + legacy line-based)
+  pollSerial();
+
+  // PMS 250ms status tick (suppressed while idle)
+  pmsTick();
 
   switch (g_state) {
     case IDLE:
       break;
 
     case BUILD: {
-      if (roundIdx == 0) {
+      if (g_roundIdx == 0) {
         buildScenes_level1_sub2();
-        Serial.println("[Master] Using Level 1 (round 1)");
-      } else if (roundIdx == 1) {
+        DBG_PRINTLN("[Master] Using Level 1 (round 1)");
+      } else if (g_roundIdx == 1) {
         buildScenes_level2_randomBases();
-        Serial.println("[Master] Using Level 2 (round 2)");
+        DBG_PRINTLN("[Master] Using Level 2 (round 2)");
       } else {
         buildScenes_level3_subs();
-        Serial.println("[Master] Using Level 3 (round 3 - infinite)");
+        DBG_PRINTLN("[Master] Using Level 3 (round 3 - infinite)");
       }
 
       cmdSetScene(SIDE_A_MAC, sceneA);
       cmdSetScene(SIDE_B_MAC, sceneB);
 
-      Serial.printf("[Master] BUILD done -> ANNOUNCE (curTimeoutMs=%lums)\n",
-                    (unsigned long)curTimeoutMs);
+      DBG_PRINTF("[Master] BUILD done -> ANNOUNCE (curTimeoutMs=%lums)\n",
+                 (unsigned long)g_curTimeoutMs);
       g_state = ANNOUNCE;
       break;
     }
@@ -687,95 +1058,117 @@ void loop() {
       cmdStartLoopAll();
       cmdLedAllWhite();
       lastSide = lastSlot = 255;
-      t0 = millis();
-      Serial.println("[Master] ANNOUNCE -> WAIT");
+      g_waitStartMs = millis();
+      DBG_PRINTLN("[Master] ANNOUNCE -> WAIT");
       g_state = WAIT;
       break;
 
     case WAIT: {
       // TIMEOUT = lose a life
-      if (millis() - t0 > curTimeoutMs) {
+      if (millis() - g_waitStartMs > g_curTimeoutMs) {
         cmdStopAll();
-        if (lives > 0) lives--;
-        Serial.printf("[Master] TIMEOUT -> LIFE LOST (lives=%u)\n", (unsigned)lives);
+        if (g_lives > 0) g_lives--;
+        DBG_PRINTF("[Master] TIMEOUT -> LIFE LOST (lives=%u)\n", (unsigned)g_lives);
+
+        // PMS event + reason marker
+        g_pmsLastReason = "life";
+        pmsPrintEventLife(-1, g_lives);
+
         cmdBlinkAll(/*red*/0, BLINK_ON_MS_WRONG, BLINK_OFF_MS_WRONG);
         resultPauseUntil = millis() + BLINK_REPS * (BLINK_ON_MS_WRONG + BLINK_OFF_MS_WRONG) + 100;
 
-        if (lives == 0) {
-          Serial.println("[Master] OUT OF LIVES -> GAME OVER");
-          nextAfterBlink   = IDLE;
+        if (g_lives == 0) {
+          DBG_PRINTLN("[Master] OUT OF LIVES -> GAME OVER");
+          nextAfterBlink = IDLE;
+
+          // Emit game_end now (before idle silence)
+          pmsMaybeEmitGameEnd("no_lives");
         } else {
-          nextAfterBlink   = BUILD;  // try again, same round/points/timeout
+          nextAfterBlink = BUILD;  // try again, same round/points/timeout
         }
-        g_state          = PAUSE;
+        g_state = PAUSE;
         break;
       }
 
       if (lastSide != 255) {
-        Serial.printf("[Master] PICK side=%u slot=%u\n", lastSide, lastSlot);
+        DBG_PRINTF("[Master] PICK side=%u slot=%u\n", lastSide, lastSlot);
         cmdStopAll();
 
         bool correct = (lastSide==0) ? slotIsOdd_A[lastSlot & 3]
                                      : slotIsOdd_B[lastSlot & 3];
 
         if (correct) {
-          Serial.println("[Master] PICK -> CORRECT");
+          DBG_PRINTLN("[Master] PICK -> CORRECT");
           cmdBlinkAll(/*green*/1, BLINK_ON_MS_CORRECT, BLINK_OFF_MS_CORRECT);
           resultPauseUntil = millis() + BLINK_REPS * (BLINK_ON_MS_CORRECT + BLINK_OFF_MS_CORRECT) + 100;
 
+          // PMS score event
+          g_scoreTotal++;
+          g_pmsLastReason = "score";
+          pmsPrintEventScore(1, g_scoreTotal);
+
           // SPEED UP timeout after each correct
-          uint32_t newTimeout = (uint32_t)(curTimeoutMs * TIME_DECAY_FACTOR);
+          uint32_t newTimeout = (uint32_t)(g_curTimeoutMs * TIME_DECAY_FACTOR);
           if (newTimeout < MIN_TIMEOUT_MS) newTimeout = MIN_TIMEOUT_MS;
-          curTimeoutMs = newTimeout;
-          Serial.printf("[Master] Timeout decayed to %lums\n", (unsigned long)curTimeoutMs);
+          g_curTimeoutMs = newTimeout;
+          DBG_PRINTF("[Master] Timeout decayed to %lums\n", (unsigned long)g_curTimeoutMs);
 
           // Round progression logic
-          if (++points >= 3) {
-            points = 0;
+          if (++g_pointsInRound >= 3) {
+            g_pointsInRound = 0;
 
-            if (roundIdx < 2) {
+            if (g_roundIdx < 2) {
               // Finished round 1 or 2 -> go to next round, reset timeout for that round
-              roundIdx++;
-              uint8_t idx = (roundIdx < 3) ? roundIdx : 2;
-              curTimeoutMs = BASE_TIMEOUT_MS[idx];
-              Serial.printf("[Master] Round %u complete -> next round (timeout reset to %lums)\n",
-                            (unsigned)roundIdx, (unsigned long)curTimeoutMs);
+              g_roundIdx++;
+              g_curTimeoutMs = BASE_TIMEOUT_MS[g_roundIdx];
+              DBG_PRINTF("[Master] Round %u complete -> next round (timeout reset to %lums)\n",
+                         (unsigned)g_roundIdx, (unsigned long)g_curTimeoutMs);
               nextAfterBlink = BUILD;
             } else {
               // Round 3 is infinite: stay in round 3, don't "win" by points
-              Serial.println("[Master] Round 3: correct point, staying in infinite round");
+              DBG_PRINTLN("[Master] Round 3: correct point, staying in infinite round");
               nextAfterBlink = BUILD;
             }
           } else {
-            Serial.printf("[Master] Point %u in current round\n", points);
+            DBG_PRINTF("[Master] Point %u in current round\n", (unsigned)g_pointsInRound);
             nextAfterBlink = BUILD;
           }
           g_state = PAUSE;
 
         } else {
           // WRONG PICK -> lose a life
-          if (lives > 0) lives--;
-          Serial.printf("[Master] PICK -> WRONG (lives=%u)\n", (unsigned)lives);
+          if (g_lives > 0) g_lives--;
+          DBG_PRINTF("[Master] PICK -> WRONG (lives=%u)\n", (unsigned)g_lives);
+
+          // PMS life event + reason marker
+          g_pmsLastReason = "life";
+          pmsPrintEventLife(-1, g_lives);
+
           cmdBlinkAll(/*red*/0, BLINK_ON_MS_WRONG, BLINK_OFF_MS_WRONG);
           resultPauseUntil = millis() + BLINK_REPS * (BLINK_ON_MS_WRONG + BLINK_OFF_MS_WRONG) + 100;
 
-          if (lives == 0) {
-            Serial.println("[Master] OUT OF LIVES -> GAME OVER");
-            nextAfterBlink   = IDLE;
+          if (g_lives == 0) {
+            DBG_PRINTLN("[Master] OUT OF LIVES -> GAME OVER");
+            nextAfterBlink = IDLE;
+
+            // Emit game_end now (before idle silence)
+            pmsMaybeEmitGameEnd("no_lives");
           } else {
-            nextAfterBlink   = BUILD;  // same round, same points, same timeout
+            nextAfterBlink = BUILD;  // same round, same points, same timeout
           }
-          g_state          = PAUSE;
+          g_state = PAUSE;
         }
       }
     } break;
 
     case PAUSE:
       if (millis() >= resultPauseUntil) {
-        Serial.printf("[Master] PAUSE done -> %s\n",
-                      (nextAfterBlink==IDLE)?"IDLE":"BUILD");
+        DBG_PRINTF("[Master] PAUSE done -> %s\n",
+                   (nextAfterBlink==IDLE) ? "IDLE" : "BUILD");
         g_state = nextAfterBlink;
       }
       break;
   }
 }
+
+
