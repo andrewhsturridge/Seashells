@@ -68,7 +68,8 @@ enum MsgType : uint8_t {
   OTA_UPDATE         = 12, // payload: url_len(uint8), url bytes...
   OTA_STATUS         = 13, // payload: side_id(uint8), code(uint8)  [0=BEGIN,1=OK,2=FAIL_WIFI,3=FAIL_HTTP,4=FAIL_UPDATE]
   ROLE_ASSIGN        = 14, // payload: sideId(uint8)  0=A, 1=B
-  CHAN_SET           = 15  // payload: wifi_channel(uint8)
+  CHAN_SET           = 15,   // payload: wifi_channel(uint8)
+  LED_WHITE_SOFT     = 16  // payload: none (soft white refresh, no blink-off)
 };
 
 // OTA_STATUS codes (data[2]) and optional payload

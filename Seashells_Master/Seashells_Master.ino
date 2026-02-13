@@ -62,7 +62,7 @@
 // 1 = Keep legacy/debug Serial prints (boot banners, manifest dump, debug logs)
 // 0 = Suppress all non-!PMS output (recommended for production PMS wiring)
 #ifndef PMS_DEBUG_SERIAL
-#define PMS_DEBUG_SERIAL 0
+#define PMS_DEBUG_SERIAL 1
 #endif
 
 // PMS STATUS tick period (ms)
@@ -111,9 +111,13 @@ static State    nextAfterBlink   = IDLE;
 static volatile uint8_t lastSide = 255, lastSlot = 255;
 
 // LED reliability: retry LED_ALL_WHITE a couple times at the start of each WAIT phase.
-static constexpr uint8_t  LED_WHITE_RETRY_COUNT          = 2;
-static constexpr uint32_t LED_WHITE_RETRY_FIRST_DELAY_MS = 80;
-static constexpr uint32_t LED_WHITE_RETRY_GAP_MS         = 120;
+// If a Side misses the initial LED update (packet loss, RF noise, etc.),
+// retry a few times during the first ~1-2 seconds of WAIT.
+//
+// We use a "soft" white refresh (no forced OFF frame first) to avoid visible flicker.
+static constexpr uint8_t  LED_WHITE_RETRY_COUNT          = 6;
+static constexpr uint32_t LED_WHITE_RETRY_FIRST_DELAY_MS = 120;
+static constexpr uint32_t LED_WHITE_RETRY_GAP_MS         = 250;
 static uint8_t  g_ledWhiteRetries = 0;
 static uint32_t g_ledWhiteRetryAtMs = 0;
 
@@ -672,6 +676,11 @@ static void cmdLedAllWhiteOne(const uint8_t mac[6]){
   sendFramed(mac, LED_ALL_WHITE, nullptr, 0);
 }
 
+// Soft white refresh (no forced OFF frame first on the Side)
+static void cmdLedAllWhiteSoftOne(const uint8_t mac[6]){
+  sendFramed(mac, LED_WHITE_SOFT, nullptr, 0);
+}
+
 static void cmdStartLoopAllOne(const uint8_t mac[6]){
   sendFramed(mac, START_LOOP_ALL, nullptr, 0);
 }
@@ -697,6 +706,18 @@ static void cmdLedAllWhite(){
     sendFramed(BCAST_MAC, LED_ALL_WHITE, nullptr, 0);
   }
 
+}
+
+// Soft white refresh (no forced OFF frame first on the Side).
+// Used for retrying white during WAIT without visible flicker.
+static void cmdLedAllWhiteSoft(){
+  for (uint8_t sid = 0; sid < 2; sid++) {
+    if (g_sideKnown[sid]) cmdLedAllWhiteSoftOne(g_sideMac[sid]);
+  }
+  // Broadcast fallback while discovery is incomplete
+  if (!g_sideKnown[0] || !g_sideKnown[1]) {
+    sendFramed(BCAST_MAC, LED_WHITE_SOFT, nullptr, 0);
+  }
 }
 
 static void cmdBlinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms){
@@ -772,12 +793,47 @@ static void printIdInfo(const char* label, uint16_t id) {
   }
 }
 
+
+// ---------- Clip exclusions ----------
+// Some clips exist on the SD card / manifest but should never be used in gameplay.
+// (Requested: remove thunder from Halloween sounds; remove walking-in-snow.)
+static bool isExcludedClip(const MasterClipMeta& m) {
+  // Exclude "thunder" within Halloween occasion set
+  if (strcasecmp(m.base, "occassions") == 0 &&
+      strcasecmp(m.sub,  "halloween")  == 0 &&
+      strcasecmp(m.sub2, "thunder")    == 0) {
+    return true;
+  }
+
+  // Exclude "walkinginsnow" within Christmas occasion set
+  if (strcasecmp(m.base, "occassions") == 0 &&
+      strcasecmp(m.sub,  "christmas")  == 0 &&
+      strcasecmp(m.sub2, "walkinginsnow") == 0) {
+    return true;
+  }
+
+  return false;
+}
+
+// Fallback: pick any non-excluded clip ID (guarded)
+static uint16_t pickAnyAllowedId() {
+  for (int guard = 0; guard < 800; guard++) {
+    size_t idx = (size_t)random((long)MASTER_CLIP_COUNT);
+    const MasterClipMeta& m = MASTER_CLIPS[idx];
+    if (isExcludedClip(m)) continue;
+    return m.id;
+  }
+  // Worst-case: return the first clip even if excluded (should never happen)
+  return MASTER_CLIPS[0].id;
+}
+
 // ---------- Category helper functions ----------
 
 // Collect unique base strings
 static size_t collectUniqueBases(const char* out[], size_t maxOut) {
   size_t n = 0;
   for (size_t i = 0; i < MASTER_CLIP_COUNT; i++) {
+    if (isExcludedClip(MASTER_CLIPS[i])) continue;
     const char* b = MASTER_CLIPS[i].base;
     bool found = false;
     for (size_t j = 0; j < n; j++) {
@@ -795,6 +851,7 @@ static size_t collectUniqueBases(const char* out[], size_t maxOut) {
 static size_t collectUniqueSubsForBase(const char* base, const char* out[], size_t maxOut) {
   size_t n = 0;
   for (size_t i = 0; i < MASTER_CLIP_COUNT; i++) {
+    if (isExcludedClip(MASTER_CLIPS[i])) continue;
     if (strcasecmp(MASTER_CLIPS[i].base, base) != 0) continue;
     const char* s = MASTER_CLIPS[i].sub;
     bool found = false;
@@ -813,6 +870,7 @@ static size_t collectUniqueSubsForBase(const char* base, const char* out[], size
 static size_t collectUniqueSub2ForBase(const char* base, const char* out[], size_t maxOut) {
   size_t n = 0;
   for (size_t i = 0; i < MASTER_CLIP_COUNT; i++) {
+    if (isExcludedClip(MASTER_CLIPS[i])) continue;
     if (strcasecmp(MASTER_CLIPS[i].base, base) != 0) continue;
     const char* s2 = MASTER_CLIPS[i].sub2;
     bool found = false;
@@ -831,6 +889,7 @@ static size_t collectUniqueSub2ForBase(const char* base, const char* out[], size
 static size_t collectIdsByBase(const char* base, uint16_t* out, size_t maxOut) {
   size_t n = 0;
   for (size_t i=0; i<MASTER_CLIP_COUNT; i++) {
+    if (isExcludedClip(MASTER_CLIPS[i])) continue;
     if (strcasecmp(MASTER_CLIPS[i].base, base) != 0) continue;
     if (n < maxOut) out[n++] = MASTER_CLIPS[i].id;
   }
@@ -841,6 +900,7 @@ static size_t collectIdsByBase(const char* base, uint16_t* out, size_t maxOut) {
 static size_t collectIdsByBaseSub(const char* base, const char* sub, uint16_t* out, size_t maxOut) {
   size_t n = 0;
   for (size_t i=0; i<MASTER_CLIP_COUNT; i++) {
+    if (isExcludedClip(MASTER_CLIPS[i])) continue;
     if (strcasecmp(MASTER_CLIPS[i].base, base) != 0) continue;
     if (strcasecmp(MASTER_CLIPS[i].sub,  sub)  != 0) continue;
     if (n < maxOut) out[n++] = MASTER_CLIPS[i].id;
@@ -852,6 +912,7 @@ static size_t collectIdsByBaseSub(const char* base, const char* sub, uint16_t* o
 static size_t collectIdsByBaseSub2(const char* base, const char* sub2, uint16_t* out, size_t maxOut) {
   size_t n = 0;
   for (size_t i=0; i<MASTER_CLIP_COUNT; i++) {
+    if (isExcludedClip(MASTER_CLIPS[i])) continue;
     if (strcasecmp(MASTER_CLIPS[i].base, base) != 0) continue;
     if (strcasecmp(MASTER_CLIPS[i].sub2, sub2) != 0) continue;
     if (n < maxOut) out[n++] = MASTER_CLIPS[i].id;
@@ -864,8 +925,7 @@ static uint16_t pickRandomIdByBase(const char* base) {
   uint16_t ids[32];
   size_t n = collectIdsByBase(base, ids, 32);
   if (n == 0) {
-    size_t idx = random((long)MASTER_CLIP_COUNT);
-    return MASTER_CLIPS[idx].id;
+    return pickAnyAllowedId();
   }
   size_t idx = (size_t)random((long)n);
   return ids[idx];
@@ -916,7 +976,7 @@ static void buildScenes_level2_randomBases() {
   size_t uCount = collectIdsByBase(baseMain, unique, 32);
   if (uCount == 0) {
     DBG_PRINTLN("[Master] Level2: no IDs for baseMain, using any IDs");
-    for (int i=0;i<7;i++) sameIds[i] = MASTER_CLIPS[random((long)MASTER_CLIP_COUNT)].id;
+    for (int i=0;i<7;i++) sameIds[i] = pickAnyAllowedId();
   } else {
     fillWithUniqueThenReuse(sameIds, 7, unique, uCount, "Level2 baseMain");
   }
@@ -925,7 +985,7 @@ static void buildScenes_level2_randomBases() {
   uint16_t uniqueOdd[32];
   size_t uOddCount = collectIdsByBase(baseOdd, uniqueOdd, 32);
   if (uOddCount == 0) {
-    oddId = MASTER_CLIPS[random((long)MASTER_CLIP_COUNT)].id;
+    oddId = pickAnyAllowedId();
   } else {
     shuffleArray(uniqueOdd, uOddCount);
     oddId = uniqueOdd[0];
@@ -1001,7 +1061,7 @@ static void buildScenes_level1_sub2() {
   uint16_t uniqueOdd[32];
   size_t uOddCount = collectIdsByBase(baseOdd, uniqueOdd, 32);
   if (uOddCount == 0) {
-    oddId = MASTER_CLIPS[random((long)MASTER_CLIP_COUNT)].id;
+    oddId = pickAnyAllowedId();
   } else {
     shuffleArray(uniqueOdd, uOddCount);
     oddId = uniqueOdd[0];
@@ -1345,7 +1405,7 @@ void loop() {
       if (g_ledWhiteRetries && lastSide == 255) {
         const uint32_t nowMs = millis();
         if ((int32_t)(nowMs - g_ledWhiteRetryAtMs) >= 0) {
-          cmdLedAllWhite();
+          cmdLedAllWhiteSoft();
           g_ledWhiteRetries--;
           g_ledWhiteRetryAtMs = nowMs + LED_WHITE_RETRY_GAP_MS;
         }

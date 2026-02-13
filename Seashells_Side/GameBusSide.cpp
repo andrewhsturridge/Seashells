@@ -11,6 +11,9 @@
 extern void side_setScene(uint16_t ids[4]);
 extern void side_playSlot(uint8_t slot);
 extern void side_ledAllWhite();
+// Like side_ledAllWhite(), but does NOT force an "all off" frame first.
+// Used for reliability refreshes during WAIT without visible flicker.
+extern void side_ledAllWhiteSoft();
 extern void side_blinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms);
 extern void side_setGameMode(bool en);
 extern void side_startLoopAll();
@@ -327,6 +330,11 @@ void GameBus_pump() {
 
       case LED_ALL_WHITE: {
         GB_onLedAllWhite();
+      } break;
+
+      case LED_WHITE_SOFT: {
+        // Reliability refresh: keep LEDs steady white without forcing an "all off" frame.
+        side_ledAllWhiteSoft();
       } break;
 
       case BLINK_ALL: {

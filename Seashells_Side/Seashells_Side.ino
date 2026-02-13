@@ -318,6 +318,15 @@ void side_ledAllWhite() {
   ledsAllColor(255, 255, 255);
 }
 
+// Soft white refresh: stop blinking but do NOT force a full "all off" frame first.
+// This helps when the Master retries white during WAIT (avoids visible flicker).
+void side_ledAllWhiteSoft() {
+  blink.active = false;
+  blink.phaseOn = false;
+  blink.remaining = 0;
+  ledsAllColor(255, 255, 255);
+}
+
 void side_blinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms) {
   blinkStart(color, on_ms, off_ms, /*reps*/3);
 }
