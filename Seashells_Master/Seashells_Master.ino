@@ -44,6 +44,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <Preferences.h>
 #include <cstring>
 
 #include "Messages.h"
@@ -61,7 +62,7 @@
 // 1 = Keep legacy/debug Serial prints (boot banners, manifest dump, debug logs)
 // 0 = Suppress all non-!PMS output (recommended for production PMS wiring)
 #ifndef PMS_DEBUG_SERIAL
-#define PMS_DEBUG_SERIAL 1
+#define PMS_DEBUG_SERIAL 0
 #endif
 
 // PMS STATUS tick period (ms)
@@ -109,6 +110,13 @@ static State    nextAfterBlink   = IDLE;
 
 static volatile uint8_t lastSide = 255, lastSlot = 255;
 
+// LED reliability: retry LED_ALL_WHITE a couple times at the start of each WAIT phase.
+static constexpr uint8_t  LED_WHITE_RETRY_COUNT          = 2;
+static constexpr uint32_t LED_WHITE_RETRY_FIRST_DELAY_MS = 80;
+static constexpr uint32_t LED_WHITE_RETRY_GAP_MS         = 120;
+static uint8_t  g_ledWhiteRetries = 0;
+static uint32_t g_ledWhiteRetryAtMs = 0;
+
 // Current scene + odd markers
 static uint16_t sceneA[4] {0,0,0,0};
 static uint16_t sceneB[4] {0,0,0,0};
@@ -152,6 +160,30 @@ static String g_serialLine;
 static void cmdLedAllWhite();
 static void cmdStopAll();
 static void cmdOtaUpdate(const uint8_t mac[6], const char* url);
+
+// =============================================================
+// ESP-NOW network state (declared early so serial handlers compile)
+// =============================================================
+
+// Broadcast MAC
+static const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+// NVS (Preferences) — shared namespace with Side (and Role.h)
+static constexpr const char* kPrefsNs = "seashells";
+static constexpr const char* kKeyChan = "chan"; // u8
+
+// Current ESP-NOW channel and discovered side peers
+static uint8_t  g_nowChannel = NOW_DEFAULT_CHANNEL;
+static uint8_t  g_sideMac[2][6] = {{0},{0}};
+static bool     g_sideKnown[2]  = {false,false};
+static uint32_t g_sideLastHelloMs[2] = {0,0};
+static uint32_t g_nextHelloReqMs = 0;
+static uint32_t g_lastHelloReqSentMs = 0; // timestamp of last broadcast HELLO_REQ
+
+// Forward declarations (implemented later)
+static void sendFramed(const uint8_t mac[6], uint8_t type, const uint8_t* payload, int plen);
+static inline void prefsSaveChannel(uint8_t ch);
+
 
 // =============================================================
 // PMS helpers
@@ -260,6 +292,9 @@ static void startGameAtLevel(uint8_t level) {
   // Clear pick latch
   lastSide = lastSlot = 255;
 
+  // Cancel any pending LED retries from a previous run
+  g_ledWhiteRetries = 0;
+
   // Enter active state machine
   cmdLedAllWhite();
   g_state = BUILD;
@@ -278,6 +313,7 @@ static void stopGameFromHost(const char* reason) {
   if (g_state == IDLE) return;
 
   cmdStopAll();
+  g_ledWhiteRetries = 0;
   g_state = IDLE;
   DBG_PRINTLN("[Master] Game ended -> IDLE");
 
@@ -361,6 +397,61 @@ static void handleLegacyLine(const String& rawLine) {
   line.trim();
   if (line.length() == 0) return;
 
+  // ------------------------------------------------------------------------
+  // New utility commands (line-based)
+  // ------------------------------------------------------------------------
+  {
+    String up = line;
+    up.toUpperCase();
+
+    // CHAN <1-13>
+    // Persist the ESP-NOW channel in NVS and tell the sides to switch too.
+    // NOTE: Make sure both sides are powered when you run this.
+    if (up.startsWith("CHAN")) {
+      String rest = line.substring(4);
+      rest.trim();
+      int ch = rest.toInt();
+      if (ch >= 1 && ch <= 13) {
+        uint8_t payload[1] = { (uint8_t)ch };
+
+        DBG_PRINTF("[Master] CHAN %d -> sending CHAN_SET + reboot\n", ch);
+
+        // Unicast (reliable) to known sides
+        for (uint8_t sid = 0; sid < 2; sid++) {
+          if (g_sideKnown[sid]) sendFramed(g_sideMac[sid], CHAN_SET, payload, 1);
+        }
+        // Broadcast fallback (helps if a side is unpaired but listening)
+        sendFramed(BCAST_MAC, CHAN_SET, payload, 1);
+
+        prefsSaveChannel((uint8_t)ch);
+        delay(80);
+        ESP.restart();
+      } else {
+        DBG_PRINTLN("Usage: CHAN <1-13>");
+      }
+      return;
+    }
+
+    // INFO
+    if (up == "INFO") {
+      DBG_PRINTF("[Master] channel=%u sideA=%s sideB=%s\n",
+                 (unsigned)g_nowChannel,
+                 g_sideKnown[0] ? "KNOWN" : "UNKNOWN",
+                 g_sideKnown[1] ? "KNOWN" : "UNKNOWN");
+      if (g_sideKnown[0]) {
+        DBG_PRINTF("  Side A MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                   g_sideMac[0][0],g_sideMac[0][1],g_sideMac[0][2],
+                   g_sideMac[0][3],g_sideMac[0][4],g_sideMac[0][5]);
+      }
+      if (g_sideKnown[1]) {
+        DBG_PRINTF("  Side B MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                   g_sideMac[1][0],g_sideMac[1][1],g_sideMac[1][2],
+                   g_sideMac[1][3],g_sideMac[1][4],g_sideMac[1][5]);
+      }
+      return;
+    }
+  }
+
   // Legacy commands are line-based to avoid accidental triggers from PMS traffic.
   if (line.length() == 1) {
     char c = line.charAt(0);
@@ -376,17 +467,27 @@ static void handleLegacyLine(const String& rawLine) {
     }
     if (c == 'u') {
       DBG_PRINTLN("[Master] OTA both sides");
-      cmdOtaUpdate(SIDE_A_MAC, OTA_URL_SIDE_BIN);
+      if (g_sideKnown[0]) {
+        cmdOtaUpdate(g_sideMac[0], OTA_URL_SIDE_BIN);
+      } else {
+        DBG_PRINTLN("[Master] Side A not discovered yet (no OTA)");
+      }
       delay(200);
-      cmdOtaUpdate(SIDE_B_MAC, OTA_URL_SIDE_BIN);
+      if (g_sideKnown[1]) {
+        cmdOtaUpdate(g_sideMac[1], OTA_URL_SIDE_BIN);
+      } else {
+        DBG_PRINTLN("[Master] Side B not discovered yet (no OTA)");
+      }
       return;
     }
     if (c == 'a') {
-      cmdOtaUpdate(SIDE_A_MAC, OTA_URL_SIDE_BIN);
+      if (g_sideKnown[0]) cmdOtaUpdate(g_sideMac[0], OTA_URL_SIDE_BIN);
+      else DBG_PRINTLN("[Master] Side A not discovered yet (no OTA)");
       return;
     }
     if (c == 'b') {
-      cmdOtaUpdate(SIDE_B_MAC, OTA_URL_SIDE_BIN);
+      if (g_sideKnown[1]) cmdOtaUpdate(g_sideMac[1], OTA_URL_SIDE_BIN);
+      else DBG_PRINTLN("[Master] Side B not discovered yet (no OTA)");
       return;
     }
   }
@@ -473,73 +574,177 @@ static void pmsTick() {
 
 
 
-// ---------- ESP-NOW helpers ----------
-static void addPeer(const uint8_t mac[6]) {
-  esp_now_peer_info_t p{};
-  std::memcpy(p.peer_addr, mac, 6);
-  p.channel = WIFI_CHANNEL;
-  p.encrypt = false;
-  esp_now_add_peer(&p);
+static inline bool macIsAllZero(const uint8_t mac[6]) {
+  for (int i=0;i<6;i++) if (mac[i] != 0) return false;
+  return true;
 }
 
-static void sendPkt(const uint8_t mac[6], const void* data, size_t n) {
-  esp_now_send(mac, (const uint8_t*)data, n);
+// Forward decl (used by helloReqTick)
+static void sendFramed(const uint8_t mac[6], uint8_t type, const uint8_t* payload, int plen);
+
+// Periodically solicit HELLOs from Sides so boot order doesn't matter.
+//
+// IMPORTANT:
+//  - We only broadcast HELLO_REQ while we *haven't* discovered both sides yet.
+//  - Once both sides are known, we stop sending HELLO_REQ to avoid needless traffic.
+//    (Sides will still send a HELLO on boot/reboot, which is enough to re-sync mid-game.)
+static void helloReqTick() {
+  if (g_sideKnown[0] && g_sideKnown[1]) return;  // discovery complete
+
+  const uint32_t now = millis();
+  if (now < g_nextHelloReqMs) return;
+
+  sendFramed(BCAST_MAC, HELLO_REQ, nullptr, 0);
+  g_lastHelloReqSentMs = now;
+  g_nextHelloReqMs = now + 1000; // 1 Hz while discovering
+}
+
+static inline uint8_t prefsLoadChannel() {
+  Preferences p;
+  p.begin(kPrefsNs, true);
+  uint8_t ch = p.getUChar(kKeyChan, NOW_DEFAULT_CHANNEL);
+  p.end();
+  if (ch < 1 || ch > 13) ch = NOW_DEFAULT_CHANNEL;
+  return ch;
+}
+
+static inline void prefsSaveChannel(uint8_t ch) {
+  Preferences p;
+  p.begin(kPrefsNs, false);
+  p.putUChar(kKeyChan, ch);
+  p.end();
+}
+
+static void addPeer(const uint8_t mac[6]) {
+  if (!mac || macIsAllZero(mac)) return;
+  esp_now_peer_info_t p{};
+  std::memcpy(p.peer_addr, mac, 6);
+  p.channel = g_nowChannel;
+  p.encrypt = false;
+  // ignore errors (peer may already exist)
+  (void)esp_now_add_peer(&p);
+}
+
+static void sendFramed(const uint8_t mac[6], uint8_t type, const uint8_t* payload, int plen) {
+  // Enough for our largest packet (OTA URL): header(4) + url_len(1) + url(200)
+  uint8_t buf[4 + 1 + 210];
+  int n = SS_build(buf, (int)sizeof(buf), type, payload, plen);
+  if (n > 0) {
+    esp_now_send(mac, buf, (size_t)n);
+  }
+}
+
+static inline void setSideMac(uint8_t sideId, const uint8_t mac[6]) {
+  if (sideId > 1 || !mac || macIsAllZero(mac)) return;
+  if (!g_sideKnown[sideId] || memcmp(g_sideMac[sideId], mac, 6) != 0) {
+    memcpy(g_sideMac[sideId], mac, 6);
+    g_sideKnown[sideId] = true;
+    addPeer(g_sideMac[sideId]);
+    DBG_PRINTF("[NOW] Side %c learned: %02X:%02X:%02X:%02X:%02X:%02X\n",
+               (sideId==0?'A':'B'),
+               g_sideMac[sideId][0],g_sideMac[sideId][1],g_sideMac[sideId][2],
+               g_sideMac[sideId][3],g_sideMac[sideId][4],g_sideMac[sideId][5]);
+  }
+  g_sideLastHelloMs[sideId] = millis();
+}
+
+static inline bool macEq(const uint8_t a[6], const uint8_t b[6]) {
+  return (a && b && memcmp(a, b, 6) == 0);
+}
+
+static int8_t sideIdFromSrc(const uint8_t src[6]) {
+  if (g_sideKnown[0] && macEq(src, g_sideMac[0])) return 0;
+  if (g_sideKnown[1] && macEq(src, g_sideMac[1])) return 1;
+  return -1;
 }
 
 static void cmdRoleAssign(const uint8_t mac[6], uint8_t sideId) {
-  uint8_t m[2] = { ROLE_ASSIGN, (uint8_t)(sideId&1) };
-  sendPkt(mac, m, sizeof(m));
+  uint8_t payload[1] = { (uint8_t)(sideId & 1) };
+  sendFramed(mac, ROLE_ASSIGN, payload, (int)sizeof(payload));
 }
 
 static void cmdGameModeOne(const uint8_t mac[6], bool en){
-  uint8_t m[2] = { GAME_MODE, (uint8_t)(en ? 1 : 0) };
-  sendPkt(mac, m, sizeof(m));
+  uint8_t payload[1] = { (uint8_t)(en ? 1 : 0) };
+  sendFramed(mac, GAME_MODE, payload, (int)sizeof(payload));
 }
+
 static void cmdLedAllWhiteOne(const uint8_t mac[6]){
-  uint8_t m = LED_ALL_WHITE;
-  sendPkt(mac, &m, 1);
+  sendFramed(mac, LED_ALL_WHITE, nullptr, 0);
 }
+
 static void cmdStartLoopAllOne(const uint8_t mac[6]){
-  uint8_t m = START_LOOP_ALL;
-  sendPkt(mac, &m, 1);
+  sendFramed(mac, START_LOOP_ALL, nullptr, 0);
 }
 
 static void cmdGameMode(bool en){
-  uint8_t m[2] = { GAME_MODE, (uint8_t)(en ? 1 : 0) };
-  sendPkt(SIDE_A_MAC, m, sizeof(m));
-  sendPkt(SIDE_B_MAC, m, sizeof(m));
-}
-static void cmdLedAllWhite(){
-  uint8_t m = LED_ALL_WHITE;
-  sendPkt(SIDE_A_MAC, &m, 1);
-  sendPkt(SIDE_B_MAC, &m, 1);
-}
-static void cmdBlinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms){
-  uint8_t m[6] = { BLINK_ALL,
-                   color,
-                   (uint8_t)(on_ms >> 8), (uint8_t)on_ms,
-                   (uint8_t)(off_ms >> 8), (uint8_t)off_ms };
-  sendPkt(SIDE_A_MAC, m, sizeof(m));
-  sendPkt(SIDE_B_MAC, m, sizeof(m));
-}
-static void cmdStartLoopAll(){
-  uint8_t m = START_LOOP_ALL;
-  sendPkt(SIDE_A_MAC, &m, 1);
-  sendPkt(SIDE_B_MAC, &m, 1);
-}
-static void cmdStopAll(){
-  uint8_t m = STOP_ALL;
-  sendPkt(SIDE_A_MAC, &m, 1);
-  sendPkt(SIDE_B_MAC, &m, 1);
-}
-static void cmdSetScene(const uint8_t mac[6], const uint16_t ids[4]){
-  uint8_t m[1 + 8];
-  m[0] = SET_SCENE;
-  for (int i=0;i<4;i++) {
-    m[1 + i*2] = (uint8_t)(ids[i] >> 8);
-    m[2 + i*2] = (uint8_t)(ids[i] & 0xFF);
+  uint8_t payload[1] = { (uint8_t)(en ? 1 : 0) };
+  for (uint8_t sid = 0; sid < 2; sid++) {
+    if (g_sideKnown[sid]) sendFramed(g_sideMac[sid], GAME_MODE, payload, (int)sizeof(payload));
   }
-  sendPkt(mac, m, sizeof(m));
+  // Broadcast fallback while discovery is incomplete
+  if (!g_sideKnown[0] || !g_sideKnown[1]) {
+    sendFramed(BCAST_MAC, GAME_MODE, payload, (int)sizeof(payload));
+  }
+
+}
+
+static void cmdLedAllWhite(){
+  for (uint8_t sid = 0; sid < 2; sid++) {
+    if (g_sideKnown[sid]) sendFramed(g_sideMac[sid], LED_ALL_WHITE, nullptr, 0);
+  }
+  // Broadcast fallback while discovery is incomplete
+  if (!g_sideKnown[0] || !g_sideKnown[1]) {
+    sendFramed(BCAST_MAC, LED_ALL_WHITE, nullptr, 0);
+  }
+
+}
+
+static void cmdBlinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms){
+  uint8_t payload[5] = {
+    color,
+    (uint8_t)(on_ms >> 8), (uint8_t)on_ms,
+    (uint8_t)(off_ms >> 8), (uint8_t)off_ms
+  };
+  for (uint8_t sid = 0; sid < 2; sid++) {
+    if (g_sideKnown[sid]) sendFramed(g_sideMac[sid], BLINK_ALL, payload, (int)sizeof(payload));
+  }
+  // Broadcast fallback while discovery is incomplete
+  if (!g_sideKnown[0] || !g_sideKnown[1]) {
+    sendFramed(BCAST_MAC, BLINK_ALL, payload, (int)sizeof(payload));
+  }
+
+}
+
+static void cmdStartLoopAll(){
+  for (uint8_t sid = 0; sid < 2; sid++) {
+    if (g_sideKnown[sid]) sendFramed(g_sideMac[sid], START_LOOP_ALL, nullptr, 0);
+  }
+  // Broadcast fallback while discovery is incomplete
+  if (!g_sideKnown[0] || !g_sideKnown[1]) {
+    sendFramed(BCAST_MAC, START_LOOP_ALL, nullptr, 0);
+  }
+
+}
+
+static void cmdStopAll(){
+  for (uint8_t sid = 0; sid < 2; sid++) {
+    if (g_sideKnown[sid]) sendFramed(g_sideMac[sid], STOP_ALL, nullptr, 0);
+  }
+  // Broadcast fallback while discovery is incomplete
+  if (!g_sideKnown[0] || !g_sideKnown[1]) {
+    sendFramed(BCAST_MAC, STOP_ALL, nullptr, 0);
+  }
+
+}
+
+static void cmdSetSceneSide(uint8_t sideId, const uint16_t ids[4]){
+  if (sideId > 1 || !g_sideKnown[sideId]) return;
+  uint8_t payload[8];
+  for (int i=0;i<4;i++) {
+    payload[i*2]     = (uint8_t)(ids[i] >> 8);
+    payload[i*2 + 1] = (uint8_t)(ids[i] & 0xFF);
+  }
+  sendFramed(g_sideMac[sideId], SET_SCENE, payload, (int)sizeof(payload));
 }
 
 static void endGame() {
@@ -917,55 +1122,117 @@ static void buildScenes_level3_subs() {
 // OTA helper
 static void cmdOtaUpdate(const uint8_t mac[6], const char* url) {
   const size_t ulen = strnlen(url, 200);
-  uint8_t m[1 + 1 + 200];
-  m[0] = OTA_UPDATE;
-  m[1] = (uint8_t)ulen;
-  memcpy(m+2, url, ulen);
-  sendPkt(mac, m, 2 + ulen);
+  uint8_t payload[1 + 200];
+  payload[0] = (uint8_t)ulen;
+  memcpy(payload + 1, url, ulen);
+  sendFramed(mac, OTA_UPDATE, payload, 1 + (int)ulen);
 }
 
 // ---------- ESP-NOW ----------
 static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
-  if (!info || !data || len < 1) return;
-  const uint8_t type = data[0];
-  const bool isA = (std::memcmp(info->src_addr, SIDE_A_MAC, 6) == 0);
+  if (!info || !data || len < (int)SS_HDR_LEN) return;
 
-  if (type == HELLO && len >= 6) {
-    const uint8_t* mac = info->src_addr;
+  uint8_t type = 0;
+  const uint8_t* payload = nullptr;
+  int plen = 0;
+  if (!SS_parse(data, len, type, payload, plen)) return;
 
-    DBG_PRINTF("[Master] HELLO from %s sideId=%u poolA=%u poolB=%u\n",
-                  isA ? "Side A" : "Side B",
-                  data[1],
-                  (uint16_t)(data[2] << 8 | data[3]),
-                  (uint16_t)(data[4] << 8 | data[5]));
+  const uint8_t* src = info->src_addr;
 
-    cmdRoleAssign(mac, isA ? 0 : 1);
-    cmdGameModeOne(mac, true);
+  // -------- HELLO (discovery / role mapping) --------
+  // payload: [sideId, poolA_hi, poolA_lo, poolB_hi, poolB_lo]
+  if (type == HELLO && plen >= 5) {
+    uint8_t reported = payload[0];
+    uint16_t poolA = (uint16_t)payload[1] << 8 | payload[2];
+    uint16_t poolB = (uint16_t)payload[3] << 8 | payload[4];
 
-    if (g_state == ANNOUNCE || g_state == WAIT) {
-      cmdSetScene(mac, isA ? sceneA : sceneB);
-      cmdLedAllWhiteOne(mac);
-      cmdStartLoopAllOne(mac);
+    // Determine which side this device should be.
+    // Prefer the Side's persisted role, but resolve duplicates gracefully.
+    uint8_t assign = 255;
+    if (reported <= 1) {
+      if (!g_sideKnown[reported] || macEq(g_sideMac[reported], src)) {
+        assign = reported;
+      } else {
+        // Conflict: that role is already occupied by a different MAC.
+        // If the other slot is free, use it and tell the Side to update.
+        uint8_t other = reported ^ 1;
+        if (!g_sideKnown[other]) assign = other;
+        else assign = reported; // both claimed; treat as a possible replacement
+      }
+    } else {
+      if (!g_sideKnown[0]) assign = 0;
+      else if (!g_sideKnown[1]) assign = 1;
+      else assign = 255;
+    }
+
+    DBG_PRINTF("[Master] HELLO from %02X:%02X:%02X:%02X:%02X:%02X rep=%u assign=%u poolA=%u poolB=%u\n",
+               src[0],src[1],src[2],src[3],src[4],src[5],
+               (unsigned)reported,
+               (unsigned)assign,
+               (unsigned)poolA,
+               (unsigned)poolB);
+
+    // Determine whether this HELLO is a response to our HELLO_REQ probe.
+    const uint32_t nowMs = millis();
+    const bool respToHelloReq =
+      (g_lastHelloReqSentMs != 0) && ((nowMs - g_lastHelloReqSentMs) < 300);
+
+    // Snapshot current mapping BEFORE we update it.
+    const bool preWasKnown = (assign <= 1) ? g_sideKnown[assign] : false;
+    const bool preSameMac  = (assign <= 1) ? (preWasKnown && macEq(g_sideMac[assign], src)) : false;
+    const bool preJustLearnedOrReplaced = (assign <= 1) && (!preWasKnown || !preSameMac);
+    const bool unsolicitedHello = !respToHelloReq;
+
+    // Ensure we can unicast to this Side
+    addPeer(src);
+
+    if (assign <= 1) {
+      setSideMac(assign, src);
+      if (reported != assign) {
+        cmdRoleAssign(src, assign);
+      }
+    } else {
+      DBG_PRINTLN("[Master] HELLO ignored: both sides already claimed (or role unknown)");
+    }
+
+    // Put the side into game mode
+    cmdGameModeOne(src, true);
+
+    // If we're mid-game, (re)send state ONLY when the Side likely just came online.
+    // This avoids restarting audio/LEDs on every HELLO (e.g., when probing for discovery).
+    if ((g_state == ANNOUNCE || g_state == WAIT) && assign <= 1) {
+      if (preJustLearnedOrReplaced || unsolicitedHello) {
+        if (assign == 0)      cmdSetSceneSide(0, sceneA);
+        else                  cmdSetSceneSide(1, sceneB);
+        cmdLedAllWhiteOne(src);
+        cmdStartLoopAllOne(src);
+      }
     }
     return;
   }
 
-  if (type == BTN_EVENT) {
-    if (len >= 3) {
-      lastSide = data[1];
-      lastSlot = data[2];
-      DBG_PRINTF("[Master] BTN_EVENT side=%u slot=%u\n", lastSide, lastSlot);
-    }
+  // For everything else, only accept packets from a learned Side MAC.
+  const int8_t sid = sideIdFromSrc(src);
+  if (sid < 0) return;
+
+  // -------- BTN_EVENT --------
+  // payload: [sideId, slot]
+  if (type == BTN_EVENT && plen >= 2) {
+    lastSide = (uint8_t)sid;
+    lastSlot = payload[1];
+    DBG_PRINTF("[Master] BTN_EVENT side=%u slot=%u\n", (unsigned)lastSide, (unsigned)lastSlot);
     return;
   }
 
-  if (type == OTA_STATUS && len >= 3) {
-    const char* sideName = (data[1]==0) ? "Side A" : (data[1]==1 ? "Side B" : "Side ?");
-    uint8_t code = data[2];
+  // -------- OTA_STATUS --------
+  // payload: [sideId, code] OR [sideId, OTA_STATUS_PROGRESS, percent]
+  if (type == OTA_STATUS && plen >= 2) {
+    const char* sideName = (sid==0) ? "Side A" : "Side B";
+    uint8_t code = payload[1];
 
-    if (code == OTA_STATUS_PROGRESS && len >= 4) {
-      uint8_t pct = data[3];
-      DBG_PRINTF("[Master] OTA %s: %3u%%\n", sideName, pct);
+    if (code == OTA_STATUS_PROGRESS && plen >= 3) {
+      uint8_t pct = payload[2];
+      DBG_PRINTF("[Master] OTA %s: %3u%%\n", sideName, (unsigned)pct);
     } else {
       const char* msg =
         (code==OTA_STATUS_BEGIN)     ? "BEGIN" :
@@ -980,9 +1247,12 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
 }
 
 static void nowInit() {
+  g_nowChannel = prefsLoadChannel();
+
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   esp_wifi_set_promiscuous(true);
-  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(g_nowChannel, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
   if (esp_now_init() != ESP_OK) {
@@ -990,8 +1260,7 @@ static void nowInit() {
     return;
   }
   esp_now_register_recv_cb(onRecv);
-  addPeer(SIDE_A_MAC);
-  addPeer(SIDE_B_MAC);
+  addPeer(BCAST_MAC);
 }
 
 // ---------- Arduino ----------
@@ -1029,6 +1298,9 @@ void loop() {
   // PMS 250ms status tick (suppressed while idle)
   pmsTick();
 
+  // Periodically solicit HELLOs from Sides (boot-order independent)
+  helloReqTick();
+
   switch (g_state) {
     case IDLE:
       break;
@@ -1045,8 +1317,9 @@ void loop() {
         DBG_PRINTLN("[Master] Using Level 3 (round 3 - infinite)");
       }
 
-      cmdSetScene(SIDE_A_MAC, sceneA);
-      cmdSetScene(SIDE_B_MAC, sceneB);
+      // Send the new scenes to each Side (unicast once each Side is discovered)
+      cmdSetSceneSide(0, sceneA);
+      cmdSetSceneSide(1, sceneB);
 
       DBG_PRINTF("[Master] BUILD done -> ANNOUNCE (curTimeoutMs=%lums)\n",
                  (unsigned long)g_curTimeoutMs);
@@ -1059,14 +1332,29 @@ void loop() {
       cmdLedAllWhite();
       lastSide = lastSlot = 255;
       g_waitStartMs = millis();
+      // Retry LED_ALL_WHITE a couple times shortly after entering WAIT.
+      g_ledWhiteRetries  = LED_WHITE_RETRY_COUNT;
+      g_ledWhiteRetryAtMs = g_waitStartMs + LED_WHITE_RETRY_FIRST_DELAY_MS;
       DBG_PRINTLN("[Master] ANNOUNCE -> WAIT");
       g_state = WAIT;
       break;
 
     case WAIT: {
+      // Reliability: resend LED_ALL_WHITE a couple times right after entering WAIT.
+      // This helps if a single ESP-NOW packet was missed (no longer relying on HELLO spam).
+      if (g_ledWhiteRetries && lastSide == 255) {
+        const uint32_t nowMs = millis();
+        if ((int32_t)(nowMs - g_ledWhiteRetryAtMs) >= 0) {
+          cmdLedAllWhite();
+          g_ledWhiteRetries--;
+          g_ledWhiteRetryAtMs = nowMs + LED_WHITE_RETRY_GAP_MS;
+        }
+      }
+
       // TIMEOUT = lose a life
       if (millis() - g_waitStartMs > g_curTimeoutMs) {
         cmdStopAll();
+        g_ledWhiteRetries = 0;
         if (g_lives > 0) g_lives--;
         DBG_PRINTF("[Master] TIMEOUT -> LIFE LOST (lives=%u)\n", (unsigned)g_lives);
 
@@ -1093,6 +1381,7 @@ void loop() {
       if (lastSide != 255) {
         DBG_PRINTF("[Master] PICK side=%u slot=%u\n", lastSide, lastSlot);
         cmdStopAll();
+        g_ledWhiteRetries = 0;
 
         bool correct = (lastSide==0) ? slotIsOdd_A[lastSlot & 3]
                                      : slotIsOdd_B[lastSlot & 3];

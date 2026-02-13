@@ -4,7 +4,9 @@
 #include "Role.h"
 
 // ------- ESP-NOW / WiFi -------
-#define WIFI_CHANNEL 6
+// Default ESP-NOW channel used on first boot. After that, the Side will use the
+// channel stored in NVS (set via Master command "CHAN <n>").
+#define NOW_DEFAULT_CHANNEL 6
 
 // These are ONLY used during OTA updates, not for ESP-NOW.
 // Set them to your PHONE HOTSPOT SSID + password.
@@ -14,8 +16,7 @@
 #define OTA_CONNECT_TIMEOUT_MS 15000
 #define OTA_HTTP_TIMEOUT_MS    45000
 
-// Fill with your Master Feather's STA MAC (print on Master at boot)
-static uint8_t MASTER_MAC[6] = {0xEC,0xDA,0x3B,0x5B,0x8C,0x30};
+// NOTE: Master MAC is learned automatically over ESP-NOW and stored in NVS.
 
 // ------- AUDIO SETTINGS -------
 #define SAMPLE_RATE     44100  // 44100 or 48000; keep all files at the same rate

@@ -1,5 +1,56 @@
 #pragma once
 #include <stdint.h>
+#include <string.h>
+
+// ============================================================================
+// Seashells ESP-NOW protocol framing
+//
+// When multiple ESP-NOW games share RF space (and possibly the same WiFi
+// channel), packets from one game can arrive at another game's receive
+// callback. If the other game only checks the first byte as "message type",
+// then different games can accidentally interpret each other's packets.
+//
+// To prevent cross-talk, every Seashells packet is framed with a 4-byte header:
+//   [ magic0, magic1, proto_ver, msg_type, ...payload ]
+//
+// Receivers MUST validate magic/proto_ver before acting on msg_type.
+// ============================================================================
+
+static constexpr uint8_t SS_MAGIC0    = (uint8_t)'S';
+static constexpr uint8_t SS_MAGIC1    = (uint8_t)'H'; // "SeasHell" (distinct from Soccer's "SC")
+static constexpr uint8_t SS_PROTO_VER = 1;
+static constexpr uint8_t SS_HDR_LEN   = 4;
+
+static inline bool SS_parse(const uint8_t* data, int len,
+                            uint8_t& outType,
+                            const uint8_t*& outPayload,
+                            int& outPayloadLen) {
+  if (!data || len < (int)SS_HDR_LEN) return false;
+  if (data[0] != SS_MAGIC0 || data[1] != SS_MAGIC1) return false;
+  if (data[2] != SS_PROTO_VER) return false;
+  outType = data[3];
+  outPayload = data + SS_HDR_LEN;
+  outPayloadLen = len - (int)SS_HDR_LEN;
+  return true;
+}
+
+static inline int SS_build(uint8_t* out, int outMax,
+                           uint8_t type,
+                           const void* payload,
+                           int payloadLen) {
+  if (!out || outMax < (int)SS_HDR_LEN) return -1;
+  out[0] = SS_MAGIC0;
+  out[1] = SS_MAGIC1;
+  out[2] = SS_PROTO_VER;
+  out[3] = type;
+  if (payloadLen < 0) payloadLen = 0;
+  int copyLen = payloadLen;
+  if (copyLen > (outMax - (int)SS_HDR_LEN)) copyLen = outMax - (int)SS_HDR_LEN;
+  if (copyLen > 0 && payload) {
+    memcpy(out + SS_HDR_LEN, payload, (size_t)copyLen);
+  }
+  return (int)SS_HDR_LEN + copyLen;
+}
 
 enum MsgType : uint8_t {
   HELLO_REQ          = 0,
@@ -16,7 +67,8 @@ enum MsgType : uint8_t {
   STOP_ALL           = 11, // type = 1
   OTA_UPDATE         = 12, // payload: url_len(uint8), url bytes...
   OTA_STATUS         = 13, // payload: side_id(uint8), code(uint8)  [0=BEGIN,1=OK,2=FAIL_WIFI,3=FAIL_HTTP,4=FAIL_UPDATE]
-  ROLE_ASSIGN        = 14  // payload: sideId(uint8)  0=A, 1=B
+  ROLE_ASSIGN        = 14, // payload: sideId(uint8)  0=A, 1=B
+  CHAN_SET           = 15  // payload: wifi_channel(uint8)
 };
 
 // OTA_STATUS codes (data[2]) and optional payload
