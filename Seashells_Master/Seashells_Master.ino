@@ -46,6 +46,8 @@
 #include <esp_wifi.h>
 #include <Preferences.h>
 #include <cstring>
+#include <stdarg.h>
+#include <stdio.h>
 
 #include "Messages.h"
 #include "ConfigMaster.h"
@@ -62,7 +64,7 @@
 // 1 = Keep legacy/debug Serial prints (boot banners, manifest dump, debug logs)
 // 0 = Suppress all non-!PMS output (recommended for production PMS wiring)
 #ifndef PMS_DEBUG_SERIAL
-#define PMS_DEBUG_SERIAL 1
+#define PMS_DEBUG_SERIAL 0
 #endif
 
 // PMS STATUS tick period (ms)
@@ -205,63 +207,68 @@ static const char* pmsStateStr(PmsState st) {
   }
 }
 
+static void pmsPrintPong();
+
+// Write a full PMS line in ONE serial write to avoid interleaving/corruption
+// if other tasks (ESP-NOW recv callback, etc.) are also printing.
+#if PMS_STD_ENABLED
+static void pmsWriteLine(const char* fmt, ...) {
+  char buf[220];
+  va_list ap;
+  va_start(ap, fmt);
+  // Leave 2 bytes for '\n' + '\0'
+  int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
+  buf[n++] = '\n';
+  buf[n] = '\0';
+  Serial.write((const uint8_t*)buf, (size_t)n);
+}
+#endif
+
 static void pmsPrintPong() {
 #if PMS_STD_ENABLED
-  Serial.println(F("!PMS PONG v=1 game=seashells role=server"));
+  pmsWriteLine("!PMS PONG v=1 game=seashells role=server");
 #endif
 }
 
 static void pmsPrintEventGameStart(uint8_t level) {
 #if PMS_STD_ENABLED
-  Serial.print(F("!PMS EVENT v=1 name=game_start level="));
-  Serial.println(level);
+  pmsWriteLine("!PMS EVENT v=1 name=game_start level=%u", (unsigned)level);
 #endif
 }
 
 static void pmsPrintEventGameEnd(const char* reason, uint16_t score, uint8_t lives) {
 #if PMS_STD_ENABLED
-  Serial.print(F("!PMS EVENT v=1 name=game_end reason="));
-  Serial.print(reason);
-  Serial.print(F(" score="));
-  Serial.print(score);
-  Serial.print(F(" lives="));
-  Serial.println(lives);
+  pmsWriteLine("!PMS EVENT v=1 name=game_end reason=%s score=%u lives=%u",
+               reason, (unsigned)score, (unsigned)lives);
 #endif
 }
 
 static void pmsPrintEventScore(int32_t delta, uint16_t total) {
 #if PMS_STD_ENABLED
-  Serial.print(F("!PMS EVENT v=1 name=score delta="));
-  Serial.print(delta);
-  Serial.print(F(" total="));
-  Serial.print(total);
-  Serial.println(F(" bonus=0"));
+  pmsWriteLine("!PMS EVENT v=1 name=score delta=%ld total=%u bonus=0",
+               (long)delta, (unsigned)total);
 #endif
 }
 
 static void pmsPrintEventLife(int32_t delta, uint8_t lives) {
 #if PMS_STD_ENABLED
-  Serial.print(F("!PMS EVENT v=1 name=life delta="));
-  Serial.print(delta);
-  Serial.print(F(" lives="));
-  Serial.println(lives);
+  pmsWriteLine("!PMS EVENT v=1 name=life delta=%ld lives=%u",
+               (long)delta, (unsigned)lives);
 #endif
 }
 
 static void pmsPrintStatus(PmsState st, uint8_t level, uint16_t score, uint8_t lives, uint32_t tleftMs, const char* lastReason) {
 #if PMS_STD_ENABLED
-  Serial.print(F("!PMS STATUS v=1 state="));
-  Serial.print(pmsStateStr(st));
-  Serial.print(F(" level="));
-  Serial.print(level);
-  Serial.print(F(" score="));
-  Serial.print(score);
-  Serial.print(F(" lives="));
-  Serial.print(lives);
-  Serial.print(F(" tleft_ms="));
-  Serial.print(tleftMs);
-  Serial.print(F(" last_reason="));
-  Serial.println(lastReason);
+  pmsWriteLine("!PMS STATUS v=1 state=%s level=%u score=%u lives=%u tleft_ms=%lu last_reason=%s",
+               pmsStateStr(st),
+               (unsigned)level,
+               (unsigned)score,
+               (unsigned)lives,
+               (unsigned long)tleftMs,
+               lastReason);
 #endif
 }
 
@@ -1278,9 +1285,16 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
   // -------- BTN_EVENT --------
   // payload: [sideId, slot]
   if (type == BTN_EVENT && plen >= 2) {
-    lastSide = (uint8_t)sid;
-    lastSlot = payload[1];
-    DBG_PRINTF("[Master] BTN_EVENT side=%u slot=%u\n", (unsigned)lastSide, (unsigned)lastSlot);
+    // Latch only the FIRST button press for the current round.
+    //
+    // Without this guard, a rapid sequence like "wrong then right" (or two players
+    // pressing nearly simultaneously) can overwrite lastSide/lastSlot before the main
+    // loop processes it, making life-loss on wrong presses feel inconsistent.
+    if (lastSide == 255) {
+      lastSide = (uint8_t)sid;
+      lastSlot = (uint8_t)(payload[1] & 3);
+      DBG_PRINTF("[Master] BTN_EVENT latched side=%u slot=%u\n", (unsigned)lastSide, (unsigned)lastSlot);
+    }
     return;
   }
 
@@ -1519,5 +1533,3 @@ void loop() {
       break;
   }
 }
-
-
