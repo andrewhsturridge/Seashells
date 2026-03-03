@@ -69,7 +69,57 @@ enum MsgType : uint8_t {
   OTA_STATUS         = 13, // payload: side_id(uint8), code(uint8)  [0=BEGIN,1=OK,2=FAIL_WIFI,3=FAIL_HTTP,4=FAIL_UPDATE]
   ROLE_ASSIGN        = 14, // payload: sideId(uint8)  0=A, 1=B
   CHAN_SET           = 15,   // payload: wifi_channel(uint8)
-  LED_WHITE_SOFT     = 16  // payload: none (soft white refresh, no blink-off)
+  LED_WHITE_SOFT     = 16, // payload: none (soft white refresh, no blink-off)
+
+  // Per-slot blink pattern.
+  // payload:
+  //   slotColor[4]  (uint8 each; 0=red, 1=green, 2=white, 3=off)
+  //   on_ms         (uint16 big-endian)
+  //   off_ms        (uint16 big-endian)
+  BLINK_SLOTS        = 17,
+
+  // Per-slot audio trim in dB (signed int8 per slot).
+  // payload:
+  //   trim_db[4]     (int8 each; 0 = no change, negative = quieter, positive = louder)
+  //
+  // Applied multiplicatively on top of: MASTER_GAIN_DB * manifest volume_db.
+  SLOT_TRIM_DB       = 18,
+
+  // Audio diagnostic mode (tone generator) — used to debug channel mapping and
+  // whether any speaker/amp is effectively summing L+R.
+  // payload:
+  //   pattern_id (uint8)
+  //     0 = OFF (exit diag)
+  //     1 = I2S0 Left only   (slot0)
+  //     2 = I2S0 Right only  (slot1)
+  //     3 = I2S0 L+R (two different tones)
+  //     4 = I2S1 Left only   (slot2)
+  //     5 = I2S1 Right only  (slot3)
+  //     6 = I2S1 L+R (two different tones)
+  //     7 = All four slots (four different tones)
+  //     8 = Odd-sim: odd on slot0, common on others
+  //     9 = Odd-sim: odd on slot1, common on others
+  //    10 = Odd-sim: odd on slot2, common on others
+  //    11 = Odd-sim: odd on slot3, common on others
+  //    12 = PHASE-CANCEL I2S0: slot0=+440Hz, slot1=-440Hz (detect mono L+R summing)
+  //    13 = PHASE-CANCEL I2S1: slot2=+550Hz, slot3=-550Hz (detect mono L+R summing)
+  //    14 = MIXFIX TOGGLE (I2S0): slot0=+440Hz, slot1 silent. Toggles MIXFIX for I2S0 ON/OFF every ~1s.
+  //         slot1 LED shows state: RED=OFF, GREEN=ON.
+  //    15 = MIXFIX TOGGLE (I2S1): slot2=+550Hz, slot3 silent. Toggles MIXFIX for I2S1 ON/OFF every ~1s.
+  //         slot3 LED shows state: RED=OFF, GREEN=ON.
+  DIAG_AUDIO         = 19,
+
+  // Runtime "mix-fix" for RIGHT speakers when the amp is effectively outputting an L+R mix.
+  // payload:
+  //   mask   (uint8): bit0 applies to I2S0 RIGHT (slot1), bit1 applies to I2S1 RIGHT (slot3)
+  //   kQ12   (int16 BE): multiplier for R (Q12 fixed-point, 4096=1.0, 8192=2.0)
+  //   mQ12   (int16 BE): multiplier for L (Q12 fixed-point, 4096=1.0)
+  //
+  // Applied as: R_out = (k*R - m*L) >> 12
+  // Typical settings:
+  //   - For MIX ~= (L+R)/2  : mask=3, k=8192 (2.0), m=4096 (1.0)
+  //   - For MIX ~= (L+R)    : mask=3, k=4096 (1.0), m=4096 (1.0)
+  MIXFIX_SET         = 20
 };
 
 // OTA_STATUS codes (data[2]) and optional payload

@@ -64,7 +64,7 @@
 // 1 = Keep legacy/debug Serial prints (boot banners, manifest dump, debug logs)
 // 0 = Suppress all non-!PMS output (recommended for production PMS wiring)
 #ifndef PMS_DEBUG_SERIAL
-#define PMS_DEBUG_SERIAL 0
+#define PMS_DEBUG_SERIAL 1
 #endif
 
 // PMS STATUS tick period (ms)
@@ -100,11 +100,65 @@ enum State { IDLE, BUILD, ANNOUNCE, WAIT, PAUSE };
 static State g_state = IDLE;
 
 // Blink cadence
-static const uint8_t  BLINK_REPS              = 3;
+// Number of blink pulses shown between rounds/results.
+// (Increase for easier visual tracking / slower pacing.)
+static const uint8_t  BLINK_REPS              = 5;
 static const uint16_t BLINK_ON_MS_CORRECT     = 140;
 static const uint16_t BLINK_OFF_MS_CORRECT    = 120;
 static const uint16_t BLINK_ON_MS_WRONG       = 160;
 static const uint16_t BLINK_OFF_MS_WRONG      = 140;
+
+// =============================================================
+// Audio mitigation / diagnostics
+// =============================================================
+// IMPORTANT:
+// - The Side firmware outputs exactly ONE stream per speaker channel.
+//   If you hear "odd + common" from a single speaker, the most common causes are:
+//     (a) amp outputting a mono mix of L+R, or
+//     (b) acoustic bleed from the other 7 speakers.
+//
+// These options are SOFTWARE workarounds that can help either scenario.
+// They intentionally change the relative loudness of speakers.
+//
+// 0 = off (stock behavior)
+// 1 = mute/attenuate ONLY the odd slot's stereo-pair mate (same Side, same I2S pair)
+// 2 = attenuate ALL non-odd slots (both Sides)
+static constexpr uint8_t AUDIO_MITIGATION_MODE = 0;
+
+// Mode 1: dB applied to the odd slot's pair-mate (common) on the same Side.
+// Use something like -30 or -40 to effectively mute it.
+static constexpr int8_t  AUDIO_PAIR_MUTE_DB   = -40;
+
+// Mode 2: dB applied to all non-odd slots (common). Example: -6 or -12.
+static constexpr int8_t  AUDIO_COMMON_ATTEN_DB = -12;
+
+// =============================================================
+// Dedicated audio diagnostic mode (tone patterns)
+// =============================================================
+// This is a structured way to prove/disprove channel mixing, L/R swap, and
+// crosstalk without relying on SD clips or per-clip volume differences.
+//
+// Usage (Serial monitor, line-based):
+//   DIAG            -> prints help
+//   DIAG OFF        -> exit diag
+//   DIAG <n>        -> set pattern n on BOTH sides (1..15)
+//   DIAG A <n>      -> set pattern n on Side A only (Side B OFF)
+//   DIAG B <n>      -> set pattern n on Side B only (Side A OFF)
+//   DIAG BOTH <n>   -> same as DIAG <n>
+//   DIAG NEXT       -> next pattern
+//   DIAG PREV       -> previous pattern
+//   DIAG AUTO       -> toggle auto-cycle (every ~2.5s)
+//
+// While in DIAG mode, ANY button press will also advance to NEXT.
+static bool     g_diagAudioEnabled   = false;
+static uint8_t  g_diagPattern        = 1;     // 1..15
+static uint8_t  g_diagTargetMask     = 0x03;  // bit0=A, bit1=B
+static bool     g_diagAutoCycle      = false;
+static uint32_t g_diagNextStepMs     = 0;
+static uint32_t g_diagLastResendMs   = 0;
+static constexpr uint32_t DIAG_RESEND_PERIOD_MS = 1200;
+static constexpr uint32_t DIAG_AUTOCYCLE_MS     = 2500;
+static volatile bool g_diagAdvanceRequested = false;
 
 // Pause bookkeeping
 static uint32_t resultPauseUntil = 0;
@@ -461,6 +515,192 @@ static void handleLegacyLine(const String& rawLine) {
       }
       return;
     }
+
+    // DIAG ...  (audio diagnostic mode)
+    if (up.startsWith("DIAG")) {
+      String rest = line.substring(4);
+      rest.trim();
+
+      if (rest.length() == 0) {
+        diagPrintHelp();
+        return;
+      }
+
+      String a1 = rest;
+      String a2 = "";
+      int sp = rest.indexOf(' ');
+      if (sp >= 0) {
+        a1 = rest.substring(0, sp);
+        a2 = rest.substring(sp + 1);
+        a2.trim();
+      }
+      String a1u = a1; a1u.toUpperCase();
+      String a2u = a2; a2u.toUpperCase();
+
+      if (a1u == "HELP") {
+        diagPrintHelp();
+        return;
+      }
+      if (a1u == "OFF") {
+        diagDisable();
+        return;
+      }
+      if (a1u == "AUTO") {
+        if (!g_diagAudioEnabled) {
+          diagEnable(g_diagPattern, g_diagTargetMask, /*auto*/true);
+        } else {
+          g_diagAutoCycle = !g_diagAutoCycle;
+          DBG_PRINTF("[DIAG] auto=%s\n", g_diagAutoCycle ? "ON" : "OFF");
+          g_diagNextStepMs = millis() + DIAG_AUTOCYCLE_MS;
+        }
+        return;
+      }
+      if (a1u == "NEXT") {
+        if (!g_diagAudioEnabled) diagEnable(g_diagPattern, g_diagTargetMask, /*auto*/false);
+        diagStep(+1);
+        return;
+      }
+      if (a1u == "PREV") {
+        if (!g_diagAudioEnabled) diagEnable(g_diagPattern, g_diagTargetMask, /*auto*/false);
+        diagStep(-1);
+        return;
+      }
+
+      // DIAG A <n> / DIAG B <n> / DIAG BOTH <n>
+      if (a1u == "A" || a1u == "B" || a1u == "BOTH") {
+        uint8_t mask = (a1u == "A") ? 0x01 : (a1u == "B") ? 0x02 : 0x03;
+        int pat = a2.toInt();
+        if (pat < 1 || pat > 15) {
+          DBG_PRINTLN("Usage: DIAG A <1-15>  |  DIAG B <1-15>  |  DIAG BOTH <1-15>");
+          return;
+        }
+        diagEnable((uint8_t)pat, mask, /*auto*/false);
+        return;
+      }
+
+      // DIAG <n>
+      int pat = a1.toInt();
+      if (pat >= 1 && pat <= 15) {
+        diagEnable((uint8_t)pat, 0x03, /*auto*/false);
+        return;
+      }
+
+      DBG_PRINTLN("DIAG: unknown syntax. Type DIAG for help.");
+      return;
+    }
+
+    // MIXFIX ... (runtime RIGHT-channel de-mix)
+    // Usage:
+    //   MIXFIX                -> help
+    //   MIXFIX ON             -> enable mask=3 with k=2.0, m=1.0 on BOTH sides
+    //   MIXFIX OFF            -> disable on BOTH sides
+    //   MIXFIX A ON|OFF       -> enable/disable on Side A
+    //   MIXFIX B ON|OFF       -> enable/disable on Side B
+    //   MIXFIX BOTH ON|OFF    -> same as MIXFIX ON|OFF
+    //   MIXFIX [A|B|BOTH] <mask 0-3> <k_milli> <m_milli>
+    //     Example: MIXFIX A 1 2000 1000   (I2S0-right only, k=2.0, m=1.0)
+    //              MIXFIX BOTH 3 2000 1000
+    if (up.startsWith("MIXFIX")) {
+      String rest = line.substring(6);
+      rest.trim();
+
+      auto printHelp = [](){
+        DBG_PRINTLN("\n=== MIXFIX (runtime RIGHT-channel de-mix) ===");
+        DBG_PRINTLN("If a RIGHT speaker amp is outputting an L+R mix, MixFix can cancel LEFT leakage by pre-distorting the RIGHT samples.");
+        DBG_PRINTLN("\nCommands:");
+        DBG_PRINTLN("  MIXFIX OFF");
+        DBG_PRINTLN("  MIXFIX ON");
+        DBG_PRINTLN("  MIXFIX A ON|OFF");
+        DBG_PRINTLN("  MIXFIX B ON|OFF");
+        DBG_PRINTLN("  MIXFIX BOTH ON|OFF");
+        DBG_PRINTLN("  MIXFIX [A|B|BOTH] <mask 0-3> <k_milli> <m_milli>");
+        DBG_PRINTLN("\nmask bits:");
+        DBG_PRINTLN("  bit0 = I2S0 RIGHT (slot1 / Speaker2)");
+        DBG_PRINTLN("  bit1 = I2S1 RIGHT (slot3 / Speaker4)");
+        DBG_PRINTLN("\nTypical values:");
+        DBG_PRINTLN("  k_milli=2000, m_milli=1000  (best for MIX ~= (L+R)/2)");
+        DBG_PRINTLN("  k_milli=1000, m_milli=1000  (best for MIX ~= (L+R))\n");
+      };
+
+      if (rest.length() == 0) {
+        printHelp();
+        return;
+      }
+
+      // Tokenize (simple split on spaces)
+      String t1 = rest;
+      String t2 = "";
+      String t3 = "";
+      String t4 = "";
+
+      int p1 = t1.indexOf(' ');
+      if (p1 >= 0) {
+        t2 = t1.substring(p1 + 1); t2.trim();
+        t1 = t1.substring(0, p1);  t1.trim();
+        int p2 = t2.indexOf(' ');
+        if (p2 >= 0) {
+          t3 = t2.substring(p2 + 1); t3.trim();
+          t2 = t2.substring(0, p2);  t2.trim();
+          int p3 = t3.indexOf(' ');
+          if (p3 >= 0) {
+            t4 = t3.substring(p3 + 1); t4.trim();
+            t3 = t3.substring(0, p3);  t3.trim();
+          }
+        }
+      }
+
+      String t1u=t1; t1u.toUpperCase();
+      String t2u=t2; t2u.toUpperCase();
+
+      uint8_t target = 0x03; // default BOTH
+      String a = t1u;
+      String b = t2u;
+      String c = t3;
+      String d = t4;
+
+      if (a == "A" || a == "B" || a == "BOTH") {
+        target = (a == "A") ? 0x01 : (a == "B") ? 0x02 : 0x03;
+        // shift args
+        a = b;
+        b = c;  // original t3
+        c = d;  // original t4
+        d = "";
+      }
+
+      if (a == "ON" || a == "OFF") {
+        if (a == "OFF") {
+          cmdMixFixApply(target, /*mask*/0, /*k*/q12FromMilli(2000), /*m*/q12FromMilli(1000));
+          DBG_PRINTLN("[MIXFIX] OFF sent");
+        } else {
+          cmdMixFixApply(target, /*mask*/3, /*k*/q12FromMilli(2000), /*m*/q12FromMilli(1000));
+          DBG_PRINTLN("[MIXFIX] ON sent (mask=3 k=2.0 m=1.0)");
+        }
+        return;
+      }
+
+      // Expect numeric: <mask> <k_milli> <m_milli>
+      if (a.length() == 0 || b.length() == 0 || c.length() == 0) {
+        DBG_PRINTLN("MIXFIX: missing args. Type MIXFIX for help.");
+        return;
+      }
+
+      int mask = a.toInt();
+      int kMilli = b.toInt();
+      int mMilli = c.toInt();
+      if (mask < 0 || mask > 3) {
+        DBG_PRINTLN("MIXFIX: mask must be 0..3");
+        return;
+      }
+
+      int16_t kQ12 = q12FromMilli(kMilli);
+      int16_t mQ12 = q12FromMilli(mMilli);
+      cmdMixFixApply(target, (uint8_t)mask, kQ12, mQ12);
+      DBG_PRINTF("[MIXFIX] sent target=0x%02X mask=%d k=%.3f m=%.3f\n",
+                 (unsigned)target, mask,
+                 (double)kQ12 / 4096.0,
+                 (double)mQ12 / 4096.0);
+      return;
+    }
   }
 
   // Legacy commands are line-based to avoid accidental triggers from PMS traffic.
@@ -743,6 +983,41 @@ static void cmdBlinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms){
 
 }
 
+// Per-slot blink pattern (red for wrong, green for correct). No broadcast fallback
+// because each Side can have a different slot layout.
+static void cmdBlinkSlotsOne(const uint8_t mac[6], const uint8_t slotColors[4],
+                             uint16_t on_ms, uint16_t off_ms) {
+  uint8_t payload[8];
+  payload[0] = slotColors[0];
+  payload[1] = slotColors[1];
+  payload[2] = slotColors[2];
+  payload[3] = slotColors[3];
+  payload[4] = (uint8_t)(on_ms >> 8);
+  payload[5] = (uint8_t)(on_ms & 0xFF);
+  payload[6] = (uint8_t)(off_ms >> 8);
+  payload[7] = (uint8_t)(off_ms & 0xFF);
+  sendFramed(mac, BLINK_SLOTS, payload, (int)sizeof(payload));
+}
+
+static void cmdBlinkRevealCorrect(uint16_t on_ms, uint16_t off_ms) {
+  // If discovery isn't complete, fall back to a simple red blink.
+  if (!g_sideKnown[0] || !g_sideKnown[1]) {
+    cmdBlinkAll(/*red*/0, on_ms, off_ms);
+    return;
+  }
+
+  // Build per-side color maps: 0=red (wrong), 1=green (correct)
+  uint8_t colorsA[4];
+  uint8_t colorsB[4];
+  for (int i=0;i<4;i++) {
+    colorsA[i] = slotIsOdd_A[i] ? 1 : 0;
+    colorsB[i] = slotIsOdd_B[i] ? 1 : 0;
+  }
+
+  cmdBlinkSlotsOne(g_sideMac[0], colorsA, on_ms, off_ms);
+  cmdBlinkSlotsOne(g_sideMac[1], colorsB, on_ms, off_ms);
+}
+
 static void cmdStartLoopAll(){
   for (uint8_t sid = 0; sid < 2; sid++) {
     if (g_sideKnown[sid]) sendFramed(g_sideMac[sid], START_LOOP_ALL, nullptr, 0);
@@ -773,6 +1048,253 @@ static void cmdSetSceneSide(uint8_t sideId, const uint16_t ids[4]){
     payload[i*2 + 1] = (uint8_t)(ids[i] & 0xFF);
   }
   sendFramed(g_sideMac[sideId], SET_SCENE, payload, (int)sizeof(payload));
+}
+
+// Per-slot audio trim in dB (signed int8 per slot). Applied by the Side.
+// This is a pure software workaround to reduce perceived "two sounds" when
+// a speaker/amp is effectively summing L+R, or when acoustic bleed is strong.
+static void cmdSetSlotTrimSide(uint8_t sideId, const int8_t trim_db[4]) {
+  if (sideId > 1 || !g_sideKnown[sideId] || !trim_db) return;
+  uint8_t payload[4];
+  for (int i=0;i<4;i++) payload[i] = (uint8_t)trim_db[i];
+  sendFramed(g_sideMac[sideId], SLOT_TRIM_DB, payload, (int)sizeof(payload));
+}
+
+// =============================================================
+// MIXFIX (runtime RIGHT-channel de-mix) helpers
+// =============================================================
+
+static inline int16_t q12FromMilli(int milli) {
+  if (milli < 0) milli = 0;
+  if (milli > 4000) milli = 4000; // cap at 4.0
+  int32_t q12 = ((int32_t)milli * 4096 + 500) / 1000; // rounded
+  if (q12 > 16384) q12 = 16384;
+  return (int16_t)q12;
+}
+
+static void cmdMixFixSide(uint8_t sideId, uint8_t mask, int16_t kQ12, int16_t mQ12) {
+  if (sideId > 1 || !g_sideKnown[sideId]) return;
+  uint8_t payload[5];
+  payload[0] = (uint8_t)(mask & 0x03);
+  payload[1] = (uint8_t)((uint16_t)kQ12 >> 8);
+  payload[2] = (uint8_t)((uint16_t)kQ12 & 0xFF);
+  payload[3] = (uint8_t)((uint16_t)mQ12 >> 8);
+  payload[4] = (uint8_t)((uint16_t)mQ12 & 0xFF);
+
+  // Send a few times to survive dropped ESP-NOW packets.
+  for (int i=0;i<3;i++) {
+    sendFramed(g_sideMac[sideId], MIXFIX_SET, payload, (int)sizeof(payload));
+    delay(12);
+  }
+}
+
+static void cmdMixFixApply(uint8_t targetMask, uint8_t mask, int16_t kQ12, int16_t mQ12) {
+  if (targetMask & 0x01) cmdMixFixSide(0, mask, kQ12, mQ12);
+  if (targetMask & 0x02) cmdMixFixSide(1, mask, kQ12, mQ12);
+
+  // Broadcast fallback helps if discovery is incomplete.
+  if (!g_sideKnown[0] || !g_sideKnown[1]) {
+    uint8_t payload[5];
+    payload[0] = (uint8_t)(mask & 0x03);
+    payload[1] = (uint8_t)((uint16_t)kQ12 >> 8);
+    payload[2] = (uint8_t)((uint16_t)kQ12 & 0xFF);
+    payload[3] = (uint8_t)((uint16_t)mQ12 >> 8);
+    payload[4] = (uint8_t)((uint16_t)mQ12 & 0xFF);
+    sendFramed(BCAST_MAC, MIXFIX_SET, payload, (int)sizeof(payload));
+  }
+}
+
+static inline bool findOdd(uint8_t& outSide, uint8_t& outSlot) {
+  for (uint8_t i=0;i<4;i++) {
+    if (slotIsOdd_A[i]) { outSide = 0; outSlot = i; return true; }
+  }
+  for (uint8_t i=0;i<4;i++) {
+    if (slotIsOdd_B[i]) { outSide = 1; outSlot = i; return true; }
+  }
+  outSide = 255;
+  outSlot = 255;
+  return false;
+}
+
+// Apply the configured mitigation mode by sending SLOT_TRIM_DB to both sides.
+// Called each round (BUILD/ANNOUNCE) to keep Sides in a known state even if a
+// packet was dropped in a previous round.
+static void cmdApplyAudioMitigationForRound() {
+  int8_t tA[4] = {0,0,0,0};
+  int8_t tB[4] = {0,0,0,0};
+
+  if (AUDIO_MITIGATION_MODE == 0) {
+    // Stock behavior: no trims.
+  } else {
+    uint8_t oddSide = 255, oddSlot = 255;
+    (void)findOdd(oddSide, oddSlot);
+
+    if (AUDIO_MITIGATION_MODE == 1) {
+      // Mute/attenuate ONLY the odd slot's I2S pair-mate on the same Side.
+      // Slots are paired as 0<->1 and 2<->3, so XOR 1 gives the mate.
+      if (oddSide <= 1 && oddSlot <= 3) {
+        uint8_t mate = oddSlot ^ 1;
+        if (oddSide == 0) tA[mate] = AUDIO_PAIR_MUTE_DB;
+        else              tB[mate] = AUDIO_PAIR_MUTE_DB;
+      }
+    } else if (AUDIO_MITIGATION_MODE == 2) {
+      // Attenuate all common speakers, leave the odd at 0 dB.
+      for (uint8_t i=0;i<4;i++) {
+        if (!slotIsOdd_A[i]) tA[i] = AUDIO_COMMON_ATTEN_DB;
+        if (!slotIsOdd_B[i]) tB[i] = AUDIO_COMMON_ATTEN_DB;
+      }
+    }
+  }
+
+  // Unicast only; trims can differ per side.
+  cmdSetSlotTrimSide(0, tA);
+  cmdSetSlotTrimSide(1, tB);
+}
+
+// =============================================================
+// DIAG AUDIO (tone patterns) helpers
+// =============================================================
+
+static void cmdDiagAudioOne(uint8_t sideId, uint8_t pattern) {
+  if (sideId > 1) return;
+  if (!g_sideKnown[sideId]) return;
+
+  // Keep Sides in gameMode so button presses send BTN_EVENT (we use it to step patterns).
+  cmdGameModeOne(g_sideMac[sideId], true);
+
+  // Clear any prior mitigation trims so diag isn't affected.
+  const int8_t z[4] = {0,0,0,0};
+  cmdSetSlotTrimSide(sideId, z);
+
+  // Send the pattern a few times to survive a dropped ESP-NOW packet.
+  uint8_t payload[1] = { pattern };
+  for (int i=0;i<3;i++) {
+    sendFramed(g_sideMac[sideId], DIAG_AUDIO, payload, 1);
+    delay(12);
+  }
+}
+
+static void cmdDiagAudioApply() {
+  // Apply to BOTH sides, but allow targeting one side by turning the other OFF.
+  uint8_t patA = (g_diagTargetMask & 0x01) ? g_diagPattern : 0;
+  uint8_t patB = (g_diagTargetMask & 0x02) ? g_diagPattern : 0;
+
+  if (g_sideKnown[0]) cmdDiagAudioOne(0, patA);
+  if (g_sideKnown[1]) cmdDiagAudioOne(1, patB);
+
+  g_diagLastResendMs = millis();
+}
+
+static void diagPrintHelp() {
+  DBG_PRINTLN("\n=== DIAG AUDIO (tone test) ===");
+  DBG_PRINTLN("Commands:");
+  DBG_PRINTLN("  DIAG            -> help");
+  DBG_PRINTLN("  DIAG OFF        -> exit diag");
+  DBG_PRINTLN("  DIAG <n>        -> set pattern n on BOTH sides");
+  DBG_PRINTLN("  DIAG A <n>      -> set pattern n on Side A only");
+  DBG_PRINTLN("  DIAG B <n>      -> set pattern n on Side B only");
+  DBG_PRINTLN("  DIAG BOTH <n>   -> set pattern n on BOTH sides");
+  DBG_PRINTLN("  DIAG NEXT       -> next pattern");
+  DBG_PRINTLN("  DIAG PREV       -> prev pattern");
+  DBG_PRINTLN("  DIAG AUTO       -> toggle auto-cycle (~2.5s)\n");
+
+  DBG_PRINTLN("Patterns (also shown on Side LEDs):");
+  DBG_PRINTLN("  1: I2S0 LEFT  only (slot0)  440Hz");
+  DBG_PRINTLN("  2: I2S0 RIGHT only (slot1)  880Hz");
+  DBG_PRINTLN("  3: I2S0 L+R simultaneously 440Hz + 880Hz");
+  DBG_PRINTLN("  4: I2S1 LEFT  only (slot2)  550Hz");
+  DBG_PRINTLN("  5: I2S1 RIGHT only (slot3) 1100Hz");
+  DBG_PRINTLN("  6: I2S1 L+R simultaneously 550Hz + 1100Hz");
+  DBG_PRINTLN("  7: ALL 4 (330/660/990/1320Hz)");
+  DBG_PRINTLN("  8: Odd-sim: odd slot0 (1600Hz), commons (800Hz)");
+  DBG_PRINTLN("  9: Odd-sim: odd slot1 (1600Hz), commons (800Hz)");
+  DBG_PRINTLN(" 10: Odd-sim: odd slot2 (1600Hz), commons (800Hz)");
+  DBG_PRINTLN(" 11: Odd-sim: odd slot3 (1600Hz), commons (800Hz)");
+  DBG_PRINTLN(" 12: PHASE-CANCEL I2S0: slot0=+440Hz, slot1=-440Hz (mono-sum detector)");
+  DBG_PRINTLN(" 13: PHASE-CANCEL I2S1: slot2=+550Hz, slot3=-550Hz (mono-sum detector)");
+  DBG_PRINTLN(" 14: MIXFIX TOGGLE I2S0: slot0=440Hz, slot1 silent; slot1 LED RED=OFF, GREEN=ON");
+  DBG_PRINTLN(" 15: MIXFIX TOGGLE I2S1: slot2=550Hz, slot3 silent; slot3 LED RED=OFF, GREEN=ON\n");
+
+  DBG_PRINTLN("Interpretation tips:");
+  DBG_PRINTLN("  - Most decisive: patterns 1/2/4/5. In each, the OTHER speaker in that I2S pair should be effectively silent at the cone.");
+  DBG_PRINTLN("  - Patterns 3/6: each speaker should have ONLY its own tone at the cone (440 vs 880, 550 vs 1100). If one speaker has BOTH strongly, that amp is mixing L+R.");
+  DBG_PRINTLN("  - Patterns 12/13: phase-cancel tests. If an amp outputs a mono sum (L+R), the tone will cancel and that speaker will get MUCH quieter/near silent.");
+  DBG_PRINTLN("    (If your speakers are truly separate, each cone still plays a tone; cancellation may only be noticeable in the room between speakers.)");
+  DBG_PRINTLN("  - Patterns 14/15: MixFix toggle. If the RIGHT amp is mixing L+R, turning MixFix ON should make the RIGHT speaker get noticeably quieter.");
+  DBG_PRINTLN("  - Patterns 8..11: reproduce the game scenario (odd vs common) with known tones.\n");
+}
+
+static inline uint8_t clampDiagPattern(int v) {
+  if (v < 1) v = 1;
+  if (v > 15) v = 15;
+  return (uint8_t)v;
+}
+
+static void diagEnable(uint8_t pattern, uint8_t targetMask, bool autoCycle) {
+  if (pattern < 1) pattern = 1;
+  if (pattern > 15) pattern = 15;
+  g_diagAudioEnabled = true;
+  g_diagPattern      = pattern;
+  g_diagTargetMask   = targetMask ? targetMask : 0x03;
+  g_diagAutoCycle    = autoCycle;
+  g_diagNextStepMs   = millis() + DIAG_AUTOCYCLE_MS;
+  g_diagAdvanceRequested = false;
+
+  // Stop any running game cleanly.
+  if (g_state != IDLE) stopGameFromHost("stopped");
+
+  DBG_PRINTF("[DIAG] enabled pattern=%u target=%s%s auto=%s\n",
+             (unsigned)g_diagPattern,
+             (g_diagTargetMask & 0x01) ? "A" : "",
+             (g_diagTargetMask & 0x02) ? "B" : "",
+             g_diagAutoCycle ? "ON" : "OFF");
+
+  cmdDiagAudioApply();
+}
+
+static void diagDisable() {
+  g_diagAudioEnabled = false;
+  g_diagAutoCycle    = false;
+  g_diagAdvanceRequested = false;
+
+  // Tell both sides to exit diag.
+  g_diagTargetMask = 0x03;
+  g_diagPattern = 0;
+  if (g_sideKnown[0]) cmdDiagAudioOne(0, 0);
+  if (g_sideKnown[1]) cmdDiagAudioOne(1, 0);
+  DBG_PRINTLN("[DIAG] disabled");
+}
+
+static void diagStep(int delta) {
+  int v = (int)g_diagPattern + delta;
+  if (v < 1) v = 15;
+  if (v > 15) v = 1;
+  g_diagPattern = (uint8_t)v;
+  DBG_PRINTF("[DIAG] pattern=%u\n", (unsigned)g_diagPattern);
+  cmdDiagAudioApply();
+}
+
+static void diagTick() {
+  if (!g_diagAudioEnabled) return;
+  const uint32_t now = millis();
+
+  // Button press while in DIAG -> NEXT (flag set by ESP-NOW callback)
+  if (g_diagAdvanceRequested) {
+    g_diagAdvanceRequested = false;
+    diagStep(+1);
+    g_diagNextStepMs = now + DIAG_AUTOCYCLE_MS;
+  }
+
+  // Auto-cycle
+  if (g_diagAutoCycle && (int32_t)(now - g_diagNextStepMs) >= 0) {
+    diagStep(+1);
+    g_diagNextStepMs = now + DIAG_AUTOCYCLE_MS;
+  }
+
+  // Periodic resend (helps if a Side rebooted)
+  if ((int32_t)(now - g_diagLastResendMs) >= (int32_t)DIAG_RESEND_PERIOD_MS) {
+    cmdDiagAudioApply();
+  }
 }
 
 static void endGame() {
@@ -1285,6 +1807,12 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
   // -------- BTN_EVENT --------
   // payload: [sideId, slot]
   if (type == BTN_EVENT && plen >= 2) {
+    // In DIAG mode, any button press advances to the next pattern.
+    if (g_diagAudioEnabled) {
+      g_diagAdvanceRequested = true;
+      return;
+    }
+
     // Latch only the FIRST button press for the current round.
     //
     // Without this guard, a rapid sequence like "wrong then right" (or two players
@@ -1375,6 +1903,12 @@ void loop() {
   // Periodically solicit HELLOs from Sides (boot-order independent)
   helloReqTick();
 
+  // Dedicated audio diagnostic mode (tone patterns)
+  if (g_diagAudioEnabled) {
+    diagTick();
+    return;
+  }
+
   switch (g_state) {
     case IDLE:
       break;
@@ -1395,6 +1929,10 @@ void loop() {
       cmdSetSceneSide(0, sceneA);
       cmdSetSceneSide(1, sceneB);
 
+      // Optional software mitigation / diagnostic trims (sent every round so
+      // Sides don't get stuck with stale trims if a packet was dropped).
+      cmdApplyAudioMitigationForRound();
+
       DBG_PRINTF("[Master] BUILD done -> ANNOUNCE (curTimeoutMs=%lums)\n",
                  (unsigned long)g_curTimeoutMs);
       g_state = ANNOUNCE;
@@ -1402,6 +1940,8 @@ void loop() {
     }
 
     case ANNOUNCE:
+      // Re-send trims right before starting audio (extra redundancy).
+      cmdApplyAudioMitigationForRound();
       cmdStartLoopAll();
       cmdLedAllWhite();
       lastSide = lastSlot = 255;
@@ -1507,7 +2047,8 @@ void loop() {
           g_pmsLastReason = "life";
           pmsPrintEventLife(-1, g_lives);
 
-          cmdBlinkAll(/*red*/0, BLINK_ON_MS_WRONG, BLINK_OFF_MS_WRONG);
+          // Wrong press: blink all wrong (red) and reveal the correct one (green).
+          cmdBlinkRevealCorrect(BLINK_ON_MS_WRONG, BLINK_OFF_MS_WRONG);
           resultPauseUntil = millis() + BLINK_REPS * (BLINK_ON_MS_WRONG + BLINK_OFF_MS_WRONG) + 100;
 
           if (g_lives == 0) {
@@ -1533,3 +2074,5 @@ void loop() {
       break;
   }
 }
+
+

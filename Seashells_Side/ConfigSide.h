@@ -37,6 +37,28 @@
 #define I2S1_BCLK 8
 #define I2S1_LRCK 9
 
+// ------- Diagnostic / Workaround: RIGHT-channel amp in L+R mix mode -------
+// Some mono I2S amp boards can be strapped for LEFT, RIGHT, or MIX (L+R) output.
+// If your RIGHT speakers are accidentally in MIX mode, you will hear "odd+common"
+// on that speaker whenever its paired LEFT speaker plays a different sound.
+//
+// Use DIAG patterns to detect:
+//  - DIAG 1/2/4/5 confirm basic channel routing.
+//  - DIAG 12/13 are phase-cancel tests (helpful, but can be fooled by acoustic cancellation).
+//  - DIAG 14/15 are the most decisive: they *toggle* the MixFix algorithm ON/OFF and show the state
+//    on the RIGHT LED (RED=OFF, GREEN=ON). If the RIGHT speaker gets noticeably quieter on GREEN,
+//    that amp is almost certainly mixing L+R.
+//
+// These set the DEFAULT enabled mask at boot. You can also control MixFix at runtime from the Master:
+//   MIXFIX ON / MIXFIX OFF / MIXFIX A ... / MIXFIX B ...
+#define FIX_RIGHT_MIX_I2S0 0  // default enable for slot1 (Speaker2)
+#define FIX_RIGHT_MIX_I2S1 0  // default enable for slot3 (Speaker4)
+
+// Mix model for the mis-strapped amp:
+//  1 = amp output ~= (L+R)/2   (most common "average" mix)
+//  0 = amp output ~= (L+R)     (rare "sum" mix)
+#define RIGHT_MIX_MODEL_AVG 1
+
 // ------- Buttons (external pull-ups, active-low) -------
 #define BTN1_PIN 10
 #define BTN2_PIN 18

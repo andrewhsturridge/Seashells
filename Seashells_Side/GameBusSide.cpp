@@ -15,6 +15,10 @@ extern void side_ledAllWhite();
 // Used for reliability refreshes during WAIT without visible flicker.
 extern void side_ledAllWhiteSoft();
 extern void side_blinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms);
+extern void side_blinkSlots(const uint8_t slotColors[4], uint16_t on_ms, uint16_t off_ms);
+extern void side_setSlotTrimDb(const int8_t db[4]);
+extern void side_setDiagAudio(uint8_t pattern_id);
+extern void side_setMixFix(uint8_t mask, int16_t kQ12, int16_t mQ12);
 extern void side_setGameMode(bool en);
 extern void side_startLoopAll();
 extern void side_stopAll();
@@ -345,6 +349,39 @@ void GameBus_pump() {
         GB_onBlinkAll(color, on_ms, off_ms);
       } break;
 
+      case BLINK_SLOTS: {
+        if (m.len < 8) break;
+        uint8_t slotColors[4] = { m.payload[0], m.payload[1], m.payload[2], m.payload[3] };
+        uint16_t on_ms  = ((uint16_t)m.payload[4] << 8) | m.payload[5];
+        uint16_t off_ms = ((uint16_t)m.payload[6] << 8) | m.payload[7];
+        GB_onBlinkSlots(slotColors, on_ms, off_ms);
+      } break;
+
+      case SLOT_TRIM_DB: {
+        if (m.len < 4) break;
+        int8_t db[4] = {
+          (int8_t)m.payload[0],
+          (int8_t)m.payload[1],
+          (int8_t)m.payload[2],
+          (int8_t)m.payload[3]
+        };
+        GB_onSlotTrimDb(db);
+      } break;
+
+      case DIAG_AUDIO: {
+        if (m.len < 1) break;
+        GB_onDiagAudio(m.payload[0]);
+      } break;
+
+      case MIXFIX_SET: {
+        // payload: mask(uint8), kQ12(int16 BE), mQ12(int16 BE)
+        if (m.len < 5) break;
+        uint8_t mask = m.payload[0];
+        int16_t kQ12 = (int16_t)(((uint16_t)m.payload[1] << 8) | (uint16_t)m.payload[2]);
+        int16_t mQ12 = (int16_t)(((uint16_t)m.payload[3] << 8) | (uint16_t)m.payload[4]);
+        GB_onMixFixSet(mask, kQ12, mQ12);
+      } break;
+
       case GAME_MODE: {
         if (m.len < 1) break;
         GB_onGameMode(m.payload[0] != 0);
@@ -395,6 +432,22 @@ void GameBus_pump() {
 void GB_onSetScene(uint16_t ids[4]) {
   side_ledAllWhite();
   side_setScene(ids);
+}
+
+void GB_onBlinkSlots(const uint8_t slotColors[4], uint16_t on_ms, uint16_t off_ms) {
+  side_blinkSlots(slotColors, on_ms, off_ms);
+}
+
+void GB_onSlotTrimDb(const int8_t trim_db[4]) {
+  side_setSlotTrimDb(trim_db);
+}
+
+void GB_onDiagAudio(uint8_t pattern_id) {
+  side_setDiagAudio(pattern_id);
+}
+
+void GB_onMixFixSet(uint8_t mask, int16_t kQ12, int16_t mQ12) {
+  side_setMixFix(mask, kQ12, mQ12);
 }
 
 // NEW: category-based random selection for proof-of-concept
