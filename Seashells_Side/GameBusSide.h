@@ -19,6 +19,7 @@ void GB_onSetScene(uint16_t ids[4]);
 void GB_onRequestRandom(uint8_t needA, uint8_t needB);
 void GB_onPlaySlot(uint8_t slot);
 void GB_onLedAllWhite();
+void GB_onLedSolidSlots(const uint8_t slotColors[4]);
 void GB_onBlinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms);
 void GB_onBlinkSlots(const uint8_t slotColors[4], uint16_t on_ms, uint16_t off_ms);
 void GB_onSlotTrimDb(const int8_t trim_db[4]);

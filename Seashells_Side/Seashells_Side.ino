@@ -25,7 +25,7 @@
 #include "OtaUpdate.h"
 
 // Master trim for this side (in dB). Use 0 for unity, negatives to reduce.
-#define MASTER_GAIN_DB -10
+#define MASTER_GAIN_DB -20
 
 // ======= RGB setup =======
 #define NUM_LEDS_PER  1
@@ -669,6 +669,18 @@ void side_ledAllWhiteSoft() {
   blink.remaining = 0;
   ledsAllColor(255, 255, 255);
 }
+
+// Set SOLID per-slot LED colors (no blinking).
+// codes: 0=red, 1=green, 2=white, 3=off
+void side_ledSolidSlots(const uint8_t slotColors[4]) {
+  if (diagAudioActive) return;
+  // Cancel any blinking without forcing an all-off frame.
+  blink.active = false;
+  blink.phaseOn = false;
+  blink.remaining = 0;
+  ledsSlotsByCode(slotColors);
+}
+
 
 void side_blinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms) {
   if (diagAudioActive) return;

@@ -51,8 +51,8 @@
 //
 // These set the DEFAULT enabled mask at boot. You can also control MixFix at runtime from the Master:
 //   MIXFIX ON / MIXFIX OFF / MIXFIX A ... / MIXFIX B ...
-#define FIX_RIGHT_MIX_I2S0 0  // default enable for slot1 (Speaker2)
-#define FIX_RIGHT_MIX_I2S1 0  // default enable for slot3 (Speaker4)
+#define FIX_RIGHT_MIX_I2S0 1  // default enable for slot1 (Speaker2)
+#define FIX_RIGHT_MIX_I2S1 1  // default enable for slot3 (Speaker4)
 
 // Mix model for the mis-strapped amp:
 //  1 = amp output ~= (L+R)/2   (most common "average" mix)

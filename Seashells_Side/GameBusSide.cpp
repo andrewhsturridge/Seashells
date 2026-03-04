@@ -11,6 +11,7 @@
 extern void side_setScene(uint16_t ids[4]);
 extern void side_playSlot(uint8_t slot);
 extern void side_ledAllWhite();
+extern void side_ledSolidSlots(const uint8_t slotColors[4]);
 // Like side_ledAllWhite(), but does NOT force an "all off" frame first.
 // Used for reliability refreshes during WAIT without visible flicker.
 extern void side_ledAllWhiteSoft();
@@ -341,6 +342,13 @@ void GameBus_pump() {
         side_ledAllWhiteSoft();
       } break;
 
+      case LED_SOLID_SLOTS: {
+        if (m.len < 4) break;
+        uint8_t slotColors[4] = { m.payload[0], m.payload[1], m.payload[2], m.payload[3] };
+        GB_onLedSolidSlots(slotColors);
+      } break;
+
+
       case BLINK_ALL: {
         if (m.len < 5) break;
         uint8_t  color  = m.payload[0];
@@ -479,6 +487,7 @@ void GB_onRequestRandom(uint8_t needA, uint8_t needB) {
 
 void GB_onPlaySlot(uint8_t slot) { side_playSlot(slot); }
 void GB_onLedAllWhite() { side_ledAllWhite(); }
+void GB_onLedSolidSlots(const uint8_t slotColors[4]) { side_ledSolidSlots(slotColors); }
 void GB_onBlinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms) {
   side_blinkAll(color, on_ms, off_ms);
 }

@@ -119,7 +119,12 @@ enum MsgType : uint8_t {
   // Typical settings:
   //   - For MIX ~= (L+R)/2  : mask=3, k=8192 (2.0), m=4096 (1.0)
   //   - For MIX ~= (L+R)    : mask=3, k=4096 (1.0), m=4096 (1.0)
-  MIXFIX_SET         = 20
+  MIXFIX_SET         = 20,
+
+  // Set SOLID per-slot LED colors (no blinking). Useful for audition/testing.
+  // payload:
+  //   slotColor[4]  (uint8 each; 0=red, 1=green, 2=white, 3=off)
+  LED_SOLID_SLOTS    = 21
 };
 
 // OTA_STATUS codes (data[2]) and optional payload

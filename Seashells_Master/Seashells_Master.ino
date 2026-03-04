@@ -28,11 +28,18 @@
 //   - PMS should ONLY parse lines starting with "!PMS" (ignore everything else).
 //   - No ACK/ERR by design (PMS infers success from STATUS/EVENT).
 //
-// Legacy serial (for manual tech/debug use):
-//   - This sketch used to react to single incoming characters ('s','e','u','a','b').
-//   - To prevent accidental triggers from PMS traffic (e.g., the 'e' in "level="),
-//     legacy commands are now line-based:
-//       "s" = start, "e" = end, "u" = OTA both, "a" = OTA side A, "b" = OTA side B
+// Serial console (for manual tech/debug use):
+//   - Commands are LINE-based and WORD-based to prevent accidental triggers.
+//   - Type: HELP
+//   - Common commands:
+//       START [1|2|3]      (or START level=<1..3>)
+//       STOP              (end game)
+//       OTA [A|B|BOTH]     (push Side OTA URL)
+//       CHAN <1-13>        (set ESP-NOW channel + reboot)
+//       INFO              (print channel + discovered sides)
+//       DIAG ...           (type DIAG for help)
+//       AUD ...            (type AUD for help)
+//       MIXFIX ...         (type MIXFIX for help)
 //
 // Build toggles (compile-time):
 //   - PMS_STD_ENABLED: enable/disable PMS protocol support
@@ -64,7 +71,7 @@
 // 1 = Keep legacy/debug Serial prints (boot banners, manifest dump, debug logs)
 // 0 = Suppress all non-!PMS output (recommended for production PMS wiring)
 #ifndef PMS_DEBUG_SERIAL
-#define PMS_DEBUG_SERIAL 1
+#define PMS_DEBUG_SERIAL 0
 #endif
 
 // PMS STATUS tick period (ms)
@@ -159,6 +166,55 @@ static uint32_t g_diagLastResendMs   = 0;
 static constexpr uint32_t DIAG_RESEND_PERIOD_MS = 1200;
 static constexpr uint32_t DIAG_AUTOCYCLE_MS     = 2500;
 static volatile bool g_diagAdvanceRequested = false;
+
+// =============================================================
+// SOUND AUDITION / QA MODE (browse clips + simulate rounds)
+// =============================================================
+// Tech utility to:
+//  - step through clips in MasterManifest (to judge distinctness)
+//  - simulate odd-one-out rounds (to judge pairings in context)
+//  - record per-clip trim suggestions (for SD manifest volume_db tuning)
+//
+// Usage (Serial, line-based):
+//   AUD              -> help
+//   AUD ON|OFF       -> enter/exit audition mode
+//   AUD MODE CLIP|ROUND|SIM1|SIM2|SIM3
+//   AUD NEXT|PREV    -> step through clips / scenes (depends on mode)
+//   AUD SOLOPOS <A0..A3|B0..B3|0..7>   (CLIP mode output speaker)
+//   AUD ODDPOS  <A0..A3|B0..B3|0..7>   (ROUND mode odd speaker position)
+//   AUD COMMON <id|CUR|NEXT|PREV>      (ROUND mode common clip)
+//   AUD ODD    <id|CUR|NEXT|PREV>      (ROUND mode odd clip)
+//   AUD TRIMSET <db>                  (CLIP mode: set suggested delta dB for current clip)
+//   AUD TRIMSET ODD|COMMON <db>        (ROUND mode: set suggested delta dB for odd/common clip)
+//   AUD EXPORT                         (print suggested deltas to copy into manifest.csv)
+
+enum AudMode : uint8_t { AUD_OFF=0, AUD_CLIP=1, AUD_ROUND=2, AUD_SIM=3 };
+static bool     g_audEnabled       = false;
+static AudMode  g_audMode          = AUD_CLIP;
+static uint8_t  g_audSimLevel      = 1;      // 1..3 used when mode==AUD_SIM
+static bool     g_audAuto          = false;
+static uint32_t g_audAutoPeriodMs  = 5000;
+static uint32_t g_audNextAutoMs    = 0;
+static volatile uint8_t g_audBtnPos = 255;   // 0..7 (set from BTN_EVENT), 255=none
+
+// Cursor over MASTER_CLIPS (filtered + exclusions skipped).
+static size_t   g_audCursor        = 0;
+static uint16_t g_audClipId        = 0;      // current cursor clip (CLIP mode)
+static uint16_t g_audCommonId      = 0;      // ROUND mode
+static uint16_t g_audOddId         = 0;      // ROUND mode
+static uint8_t  g_audSoloPos       = 0;      // 0..7 (A0..A3,B0..B3) for CLIP mode
+static uint8_t  g_audOddPos        = 0;      // 0..7 for ROUND mode
+
+// Optional category filters for browsing (empty = no filter).
+static String g_audFilterBase = "";
+static String g_audFilterSub  = "";
+static String g_audFilterSub2 = "";
+
+// Per-clip suggested trim delta (dB). This does NOT modify SD; it only helps you decide what to edit in manifest.csv later.
+struct ClipAdj { uint16_t id; int8_t db; };
+static ClipAdj g_audAdj[128];
+static size_t  g_audAdjCount = 0;
+
 
 // Pause bookkeeping
 static uint32_t resultPauseUntil = 0;
@@ -457,6 +513,428 @@ static void handlePmsLine(const String& rawLine) {
 #endif
 }
 
+// =============================================================
+// AUDITION helpers
+// =============================================================
+
+static inline int8_t clampInt8(int v, int lo=-40, int hi=20) {
+  if (v < lo) v = lo;
+  if (v > hi) v = hi;
+  return (int8_t)v;
+}
+
+static bool audFilterMatch(const MasterClipMeta& m) {
+  if (g_audFilterBase.length() && strcasecmp(m.base, g_audFilterBase.c_str()) != 0) return false;
+  if (g_audFilterSub.length()  && strcasecmp(m.sub,  g_audFilterSub.c_str())  != 0) return false;
+  if (g_audFilterSub2.length() && strcasecmp(m.sub2, g_audFilterSub2.c_str()) != 0) return false;
+  return true;
+}
+
+static bool audIdxAllowed(size_t idx) {
+  if (idx >= MASTER_CLIP_COUNT) return false;
+  const MasterClipMeta& m = MASTER_CLIPS[idx];
+  if (isExcludedClip(m)) return false;
+  if (!audFilterMatch(m)) return false;
+  return true;
+}
+
+static size_t audSeekIdx(size_t startIdx, int dir) {
+  if (MASTER_CLIP_COUNT == 0) return 0;
+  size_t idx = startIdx;
+  for (size_t guard = 0; guard < MASTER_CLIP_COUNT; guard++) {
+    if (dir >= 0) idx = (idx + 1) % MASTER_CLIP_COUNT;
+    else          idx = (idx + MASTER_CLIP_COUNT - 1) % MASTER_CLIP_COUNT;
+    if (audIdxAllowed(idx)) return idx;
+  }
+  return startIdx;
+}
+
+static void audEnsureCursorValid() {
+  if (MASTER_CLIP_COUNT == 0) {
+    g_audCursor = 0;
+    g_audClipId = 0;
+    return;
+  }
+  if (!audIdxAllowed(g_audCursor)) {
+    // Find the first allowed index.
+    g_audCursor = 0;
+    if (!audIdxAllowed(g_audCursor)) {
+      g_audCursor = audSeekIdx(0, +1);
+    }
+  }
+  g_audClipId = MASTER_CLIPS[g_audCursor].id;
+}
+
+static int8_t audGetAdj(uint16_t id) {
+  for (size_t i=0; i<g_audAdjCount; i++) {
+    if (g_audAdj[i].id == id) return g_audAdj[i].db;
+  }
+  return 0;
+}
+
+static void audSetAdj(uint16_t id, int8_t db) {
+  db = clampInt8((int)db);
+  for (size_t i=0; i<g_audAdjCount; i++) {
+    if (g_audAdj[i].id == id) {
+      g_audAdj[i].db = db;
+      return;
+    }
+  }
+  if (g_audAdjCount < (sizeof(g_audAdj)/sizeof(g_audAdj[0]))) {
+    g_audAdj[g_audAdjCount++] = { id, db };
+  } else {
+    // simple fallback: overwrite the oldest entry
+    g_audAdj[0] = { id, db };
+  }
+}
+
+static void audClearAdj() {
+  g_audAdjCount = 0;
+}
+
+static void audPrintClipMeta(const char* label, uint16_t id) {
+  const MasterClipMeta* cm = MasterManifest_find(id);
+  if (!cm) {
+    DBG_PRINTF("[AUD] %s id=%u (meta not found)\n", label ? label : "clip", (unsigned)id);
+    return;
+  }
+  DBG_PRINTF("[AUD] %s id=%u  %s/%s/%s\n", label ? label : "clip", (unsigned)id, cm->base, cm->sub, cm->sub2);
+}
+
+static bool audParsePosToken(const String& tokIn, uint8_t& outPos) {
+  String tok = tokIn;
+  tok.trim();
+  if (tok.length() == 0) return false;
+  String u = tok; u.toUpperCase();
+  if (u.length() == 2) {
+    char s = u.charAt(0);
+    char d = u.charAt(1);
+    if ((s == 'A' || s == 'B') && d >= '0' && d <= '3') {
+      outPos = (uint8_t)((s == 'B' ? 4 : 0) + (d - '0'));
+      return true;
+    }
+  }
+  // numeric 0..7
+  bool allDigits = true;
+  for (int i=0;i<(int)u.length();i++){
+    if (u.charAt(i) < '0' || u.charAt(i) > '9') { allDigits = false; break; }
+  }
+  if (!allDigits) return false;
+  int p = u.toInt();
+  if (p < 0 || p > 7) return false;
+  outPos = (uint8_t)p;
+  return true;
+}
+
+static uint16_t audSceneIdAtPos(uint8_t pos) {
+  if (pos < 4) return sceneA[pos & 3];
+  return sceneB[pos & 3];
+}
+
+static uint16_t audSceneOddId() {
+  for (int i=0;i<4;i++){ if (slotIsOdd_A[i] && sceneA[i]) return sceneA[i]; }
+  for (int i=0;i<4;i++){ if (slotIsOdd_B[i] && sceneB[i]) return sceneB[i]; }
+  return 0;
+}
+
+
+static void audBuildScene_clip() {
+  // Clear scenes
+  for (int i=0;i<4;i++){ sceneA[i]=0; sceneB[i]=0; slotIsOdd_A[i]=false; slotIsOdd_B[i]=false; }
+
+  uint8_t side = (g_audSoloPos >= 4) ? 1 : 0;
+  uint8_t slot = g_audSoloPos & 3;
+  if (side == 0) sceneA[slot] = g_audClipId;
+  else           sceneB[slot] = g_audClipId;
+}
+
+static void audBuildScene_round() {
+  // Fill everything with common, then place odd at ODDPOS
+  for (int i=0;i<4;i++){ sceneA[i]=g_audCommonId; sceneB[i]=g_audCommonId; slotIsOdd_A[i]=false; slotIsOdd_B[i]=false; }
+  uint8_t side = (g_audOddPos >= 4) ? 1 : 0;
+  uint8_t slot = g_audOddPos & 3;
+  if (side == 0) {
+    sceneA[slot] = g_audOddId;
+    slotIsOdd_A[slot] = true;
+  } else {
+    sceneB[slot] = g_audOddId;
+    slotIsOdd_B[slot] = true;
+  }
+}
+
+
+static void audComputeSolidLeds(uint8_t ledA[4], uint8_t ledB[4]) {
+  // codes: 0=red, 1=green, 2=white, 3=off
+  for (int i=0;i<4;i++){ ledA[i]=3; ledB[i]=3; }
+
+  if (g_audMode == AUD_CLIP) {
+    uint8_t side = (g_audSoloPos >= 4) ? 1 : 0;
+    uint8_t slot = g_audSoloPos & 3;
+    if (side==0) ledA[slot] = 2; else ledB[slot] = 2; // active = white
+    return;
+  }
+
+  // ROUND or SIM: show odd=green, common=white, silence=off
+  for (int i=0;i<4;i++){
+    if (sceneA[i] == 0) ledA[i] = 3;
+    else ledA[i] = slotIsOdd_A[i] ? 1 : 2;
+    if (sceneB[i] == 0) ledB[i] = 3;
+    else ledB[i] = slotIsOdd_B[i] ? 1 : 2;
+  }
+}
+
+static void audPushSceneToSides(const uint8_t ledA[4], const uint8_t ledB[4]) {
+  // Ensure sides don't locally play on press (we want BTN_EVENTs for control).
+  cmdGameMode(true);
+
+  // Stop previous audio, then push the new scene.
+  cmdStopAll();
+  cmdSetSceneSide(0, sceneA);
+  cmdSetSceneSide(1, sceneB);
+
+  // Apply per-clip trim suggestions as per-slot trims (audition only).
+  int8_t tA[4] = {0,0,0,0};
+  int8_t tB[4] = {0,0,0,0};
+  for (int i=0;i<4;i++){
+    if (sceneA[i]) tA[i] = audGetAdj(sceneA[i]);
+    if (sceneB[i]) tB[i] = audGetAdj(sceneB[i]);
+  }
+  cmdSetSlotTrimSide(0, tA);
+  cmdSetSlotTrimSide(1, tB);
+
+  // Start loops (Sides will set LEDs white). Then override to our solid map.
+  cmdStartLoopAll();
+  cmdLedSolidSlotsSide(0, ledA);
+  cmdLedSolidSlotsSide(1, ledB);
+}
+
+static void audPrintState() {
+  DBG_PRINTLN("\n=== AUDITION ===");
+  DBG_PRINTF("mode=%s  cursor=%u/%u  soloPos=%u  oddPos=%u\n",
+             (g_audMode==AUD_CLIP?"CLIP":(g_audMode==AUD_ROUND?"ROUND":"SIM")),
+             (unsigned)g_audCursor, (unsigned)MASTER_CLIP_COUNT,
+             (unsigned)g_audSoloPos, (unsigned)g_audOddPos);
+  if (g_audFilterBase.length() || g_audFilterSub.length() || g_audFilterSub2.length()) {
+    DBG_PRINTF("filter: base='%s' sub='%s' sub2='%s'\n",
+               g_audFilterBase.c_str(), g_audFilterSub.c_str(), g_audFilterSub2.c_str());
+  }
+
+  if (g_audMode == AUD_CLIP) {
+    audPrintClipMeta("CLIP", g_audClipId);
+    DBG_PRINTF("suggested_delta_db=%d\n", (int)audGetAdj(g_audClipId));
+  } else if (g_audMode == AUD_ROUND) {
+    audPrintClipMeta("COMMON", g_audCommonId);
+    DBG_PRINTF("common_suggested_delta_db=%d\n", (int)audGetAdj(g_audCommonId));
+    audPrintClipMeta("ODD", g_audOddId);
+    DBG_PRINTF("odd_suggested_delta_db=%d\n", (int)audGetAdj(g_audOddId));
+  } else {
+    DBG_PRINTF("SIM level=%u\n", (unsigned)g_audSimLevel);
+  }
+
+  // Print active scene IDs (8 slots).
+  for (int i=0;i<4;i++) printIdInfo("  sceneA", sceneA[i]);
+  for (int i=0;i<4;i++) printIdInfo("  sceneB", sceneB[i]);
+}
+
+static void audApply() {
+  if (!g_audEnabled) return;
+  audEnsureCursorValid();
+  if (g_audClipId == 0) g_audClipId = pickAnyAllowedId();
+  if (g_audCommonId == 0) g_audCommonId = g_audClipId;
+  if (g_audOddId == 0) {
+    size_t nx = audSeekIdx(g_audCursor, +1);
+    g_audOddId = MASTER_CLIPS[nx].id;
+    if (g_audOddId == g_audCommonId) {
+      nx = audSeekIdx(nx, +1);
+      g_audOddId = MASTER_CLIPS[nx].id;
+    }
+  }
+
+  if (g_audMode == AUD_CLIP) {
+    audBuildScene_clip();
+  } else if (g_audMode == AUD_ROUND) {
+    audBuildScene_round();
+  } else {
+    // AUD_SIM uses whatever is already in sceneA/sceneB (generated elsewhere).
+  }
+
+  uint8_t ledA[4], ledB[4];
+  audComputeSolidLeds(ledA, ledB);
+  audPushSceneToSides(ledA, ledB);
+  audPrintState();
+}
+
+static void audGenerateSimScene() {
+  if (g_audSimLevel <= 1) buildScenes_level1_sub2();
+  else if (g_audSimLevel == 2) buildScenes_level2_randomBases();
+  else buildScenes_level3_subs();
+}
+
+static void audEnable(AudMode mode, uint8_t simLevel=1) {
+  // Stop any in-progress game so we're not fighting the state machine.
+  stopGameFromHost("stopped");
+
+  // Exit DIAG if active
+  if (g_diagAudioEnabled) {
+    diagDisable();
+  }
+
+  g_audEnabled = true;
+  g_audMode = mode;
+  g_audSimLevel = simLevel;
+  if (g_audSimLevel < 1) g_audSimLevel = 1;
+  if (g_audSimLevel > 3) g_audSimLevel = 3;
+
+  g_audAuto = false;
+  g_audBtnPos = 255;
+
+  // Clear trims on entry so you start clean.
+  int8_t z[4] = {0,0,0,0};
+  cmdSetSlotTrimSide(0, z);
+  cmdSetSlotTrimSide(1, z);
+
+  audEnsureCursorValid();
+  if (g_audClipId == 0) g_audClipId = pickAnyAllowedId();
+  // Initialize common/odd defaults if needed
+  if (g_audCommonId == 0) g_audCommonId = g_audClipId;
+  if (g_audOddId == 0) {
+    size_t nx = audSeekIdx(g_audCursor, +1);
+    g_audOddId = MASTER_CLIPS[nx].id;
+  }
+
+  if (g_audMode == AUD_SIM) {
+    audGenerateSimScene();
+  }
+
+  DBG_PRINTLN("[AUD] enabled");
+  audApply();
+}
+
+static void audDisable() {
+  if (!g_audEnabled) return;
+  g_audEnabled = false;
+  g_audAuto = false;
+  g_audBtnPos = 255;
+
+  cmdStopAll();
+  // Clear trims so gameplay isn't affected later.
+  int8_t z[4] = {0,0,0,0};
+  cmdSetSlotTrimSide(0, z);
+  cmdSetSlotTrimSide(1, z);
+  // Turn LEDs off
+  uint8_t off[4] = {3,3,3,3};
+  cmdLedSolidSlotsSide(0, off);
+  cmdLedSolidSlotsSide(1, off);
+
+  DBG_PRINTLN("[AUD] disabled");
+}
+
+static void audStep(int dir) {
+  if (!g_audEnabled) return;
+  if (g_audMode == AUD_CLIP) {
+    g_audCursor = audSeekIdx(g_audCursor, dir);
+    g_audClipId = MASTER_CLIPS[g_audCursor].id;
+    audApply();
+    return;
+  }
+  if (g_audMode == AUD_ROUND) {
+    // For round audition, NEXT/PREV steps the ODD clip (common stays as reference).
+    g_audCursor = audSeekIdx(g_audCursor, dir);
+    g_audClipId = MASTER_CLIPS[g_audCursor].id;
+    g_audOddId  = g_audClipId;
+    audApply();
+    return;
+  }
+  // SIM: next scene of the same sim level
+  audGenerateSimScene();
+  audApply();
+}
+
+static void audTick() {
+  if (!g_audEnabled) return;
+
+  // Button-driven control (from BTN_EVENT).
+  if (g_audBtnPos != 255) {
+    uint8_t pos = g_audBtnPos;
+    g_audBtnPos = 255;
+    if (g_audMode == AUD_CLIP) {
+      g_audSoloPos = pos;
+      audApply();
+    } else if (g_audMode == AUD_ROUND) {
+      g_audOddPos = pos;
+      audApply();
+    } else {
+      // SIM: any press -> next scene
+      audGenerateSimScene();
+      audApply();
+    }
+  }
+
+  // Optional auto-step.
+  if (g_audAuto) {
+    const uint32_t nowMs = millis();
+    if ((int32_t)(nowMs - g_audNextAutoMs) >= 0) {
+      g_audNextAutoMs = nowMs + g_audAutoPeriodMs;
+      audStep(+1);
+    }
+  }
+}
+
+static void audPrintHelp() {
+  DBG_PRINTLN("\n=== AUD (Sound Audition / QA Mode) ===");
+  DBG_PRINTLN("This mode lets you browse clips and simulate rounds to judge:\n  (1) sound distinctness\n  (2) per-clip loudness (so you can tune manifest.csv volume_db)");
+  DBG_PRINTLN("\nBasics:");
+  DBG_PRINTLN("  AUD ON");
+  DBG_PRINTLN("  AUD OFF");
+  DBG_PRINTLN("  AUD SHOW");
+  DBG_PRINTLN("  AUD NEXT    (step clip / step odd / step sim scene)");
+  DBG_PRINTLN("  AUD PREV");
+  DBG_PRINTLN("\nModes:");
+  DBG_PRINTLN("  AUD MODE CLIP    -> play ONE clip on ONE speaker (SOLOPOS)");
+  DBG_PRINTLN("  AUD MODE ROUND   -> play COMMON on 7 speakers, ODD on 1 (ODDPOS)");
+  DBG_PRINTLN("  AUD MODE SIM1    -> generate real Level-1 scenes (base+sub2 family vs other base)");
+  DBG_PRINTLN("  AUD MODE SIM2    -> generate real Level-2 scenes (base vs different base)");
+  DBG_PRINTLN("  AUD MODE SIM3    -> generate real Level-3 scenes (sub vs different sub, same base)");
+  DBG_PRINTLN("\nPosition selection:");
+  DBG_PRINTLN("  AUD SOLOPOS A0..A3 | B0..B3 | 0..7");
+  DBG_PRINTLN("  AUD ODDPOS  A0..A3 | B0..B3 | 0..7");
+  DBG_PRINTLN("  AUD ROTATE   (ROUND: oddpos = next)");
+  DBG_PRINTLN("\nChoosing clips (ROUND mode):");
+  DBG_PRINTLN("  AUD COMMON <id|CUR|NEXT|PREV>");
+  DBG_PRINTLN("  AUD ODD    <id|CUR|NEXT|PREV>");
+  DBG_PRINTLN("\nPer-clip volume suggestions (does NOT edit SD):");
+  DBG_PRINTLN("  AUD TRIMSET <db>            (CLIP mode: for current clip)");
+  DBG_PRINTLN("  AUD TRIMSET ODD <db>        (ROUND mode)");
+  DBG_PRINTLN("  AUD TRIMSET COMMON <db>     (ROUND mode)");
+  DBG_PRINTLN("  AUD TRIMSET SLOT <pos> <db>   (any mode: apply to the clip currently assigned to that speaker position)");
+  DBG_PRINTLN("  AUD EXPORT                 (print deltas you can apply to manifest.csv volume_db)\n");
+  DBG_PRINTLN("Filters (for browsing):");
+  DBG_PRINTLN("  AUD BASE <name>     (or BASE CLEAR)");
+  DBG_PRINTLN("  AUD SUB  <name>     (or SUB CLEAR)");
+  DBG_PRINTLN("  AUD SUB2 <name>     (or SUB2 CLEAR)");
+  DBG_PRINTLN("  AUD CLEARFILTER");
+  DBG_PRINTLN("\nButtons while AUD is ON:");
+  DBG_PRINTLN("  - CLIP: press any button -> SOLOPOS = that speaker");
+  DBG_PRINTLN("  - ROUND: press any button -> ODDPOS = that speaker");
+  DBG_PRINTLN("  - SIM: press any button -> NEXT scene\n");
+}
+
+static void audExport() {
+  DBG_PRINTLN("\n=== AUD EXPORT (suggested deltas) ===");
+  DBG_PRINTLN("Format: id,delta_db,base,sub,sub2");
+  for (size_t i=0;i<g_audAdjCount;i++) {
+    uint16_t id = g_audAdj[i].id;
+    int db = (int)g_audAdj[i].db;
+    const MasterClipMeta* cm = MasterManifest_find(id);
+    if (cm) {
+      DBG_PRINTF("%u,%d,%s,%s,%s\n", (unsigned)id, db, cm->base, cm->sub, cm->sub2);
+    } else {
+      DBG_PRINTF("%u,%d,,,\n", (unsigned)id, db);
+    }
+  }
+  DBG_PRINTLN("\nApply these deltas to the SD /manifest.csv column 'volume_db' (new = old + delta_db).\n");
+}
+
 static void handleLegacyLine(const String& rawLine) {
   String line = rawLine;
   line.trim();
@@ -589,6 +1067,272 @@ static void handleLegacyLine(const String& rawLine) {
       return;
     }
 
+    // AUD ... (sound audition / QA)
+    // Type "AUD" for help.
+    if (up.startsWith("AUD")) {
+      String rest = line.substring(3);
+      rest.trim();
+
+      if (rest.length() == 0) {
+        audPrintHelp();
+        return;
+      }
+
+      String a1 = firstToken(rest);
+      String a2 = afterFirstToken(rest);
+      a2.trim();
+
+      String a1u = a1; a1u.toUpperCase();
+      String a2u = a2; a2u.toUpperCase();
+
+      if (a1u == "HELP") {
+        audPrintHelp();
+        return;
+      }
+      if (a1u == "ON") {
+        audEnable(AUD_CLIP, 1);
+        return;
+      }
+      if (a1u == "OFF") {
+        audDisable();
+        return;
+      }
+      if (a1u == "SHOW") {
+        if (!g_audEnabled) DBG_PRINTLN("[AUD] (currently OFF)\n");
+        audPrintState();
+        return;
+      }
+      if (a1u == "NEXT") {
+        if (!g_audEnabled) audEnable(AUD_CLIP, 1);
+        audStep(+1);
+        return;
+      }
+      if (a1u == "PREV") {
+        if (!g_audEnabled) audEnable(AUD_CLIP, 1);
+        audStep(-1);
+        return;
+      }
+
+      if (a1u == "MODE") {
+        if (a2u.length() == 0) {
+          DBG_PRINTLN("Usage: AUD MODE CLIP|ROUND|SIM1|SIM2|SIM3");
+          return;
+        }
+        if (a2u == "CLIP") {
+          if (!g_audEnabled) audEnable(AUD_CLIP, 1);
+          else { g_audMode = AUD_CLIP; audApply(); }
+          return;
+        }
+        if (a2u == "ROUND") {
+          if (!g_audEnabled) audEnable(AUD_ROUND, 1);
+          else { g_audMode = AUD_ROUND; audApply(); }
+          return;
+        }
+        if (a2u == "SIM1" || a2u == "SIM2" || a2u == "SIM3") {
+          uint8_t lvl = (a2u == "SIM2") ? 2 : (a2u == "SIM3") ? 3 : 1;
+          if (!g_audEnabled) {
+            audEnable(AUD_SIM, lvl);
+          } else {
+            g_audMode = AUD_SIM;
+            g_audSimLevel = lvl;
+            audGenerateSimScene();
+            audApply();
+          }
+          return;
+        }
+        DBG_PRINTLN("AUD MODE: unknown mode. Use CLIP|ROUND|SIM1|SIM2|SIM3");
+        return;
+      }
+
+      if (a1u == "SOLOPOS") {
+        uint8_t pos;
+        if (!audParsePosToken(a2, pos)) {
+          DBG_PRINTLN("Usage: AUD SOLOPOS A0..A3 | B0..B3 | 0..7");
+          return;
+        }
+        g_audSoloPos = pos;
+        if (!g_audEnabled) audEnable(AUD_CLIP, 1);
+        else { g_audMode = AUD_CLIP; audApply(); }
+        return;
+      }
+
+      if (a1u == "ODDPOS") {
+        uint8_t pos;
+        if (!audParsePosToken(a2, pos)) {
+          DBG_PRINTLN("Usage: AUD ODDPOS A0..A3 | B0..B3 | 0..7");
+          return;
+        }
+        g_audOddPos = pos;
+        if (!g_audEnabled) audEnable(AUD_ROUND, 1);
+        else { g_audMode = AUD_ROUND; audApply(); }
+        return;
+      }
+
+      if (a1u == "ROTATE") {
+        g_audOddPos = (uint8_t)((g_audOddPos + 1) & 7);
+        if (!g_audEnabled) audEnable(AUD_ROUND, 1);
+        else { g_audMode = AUD_ROUND; audApply(); }
+        return;
+      }
+
+      if (a1u == "COMMON" || a1u == "ODD") {
+        if (!g_audEnabled) audEnable(AUD_ROUND, 1);
+        g_audMode = AUD_ROUND;
+
+        String arg = a2;
+        arg.trim();
+        String argu = arg; argu.toUpperCase();
+        uint16_t id = 0;
+        if (argu == "CUR") {
+          id = g_audClipId;
+        } else if (argu == "NEXT") {
+          g_audCursor = audSeekIdx(g_audCursor, +1);
+          g_audClipId = MASTER_CLIPS[g_audCursor].id;
+          id = g_audClipId;
+        } else if (argu == "PREV") {
+          g_audCursor = audSeekIdx(g_audCursor, -1);
+          g_audClipId = MASTER_CLIPS[g_audCursor].id;
+          id = g_audClipId;
+        } else {
+          id = (uint16_t)arg.toInt();
+        }
+        if (id == 0) {
+          DBG_PRINTLN("Usage: AUD COMMON <id|CUR|NEXT|PREV>  or  AUD ODD <id|CUR|NEXT|PREV>");
+          return;
+        }
+        if (a1u == "COMMON") g_audCommonId = id; else g_audOddId = id;
+        audApply();
+        return;
+      }
+
+      if (a1u == "TRIMSET") {
+        // Sets a suggested delta dB for a clip (does NOT edit SD).
+        //
+        //   AUD TRIMSET <db>                 -> CLIP: current clip
+        //                                     ROUND: odd clip
+        //                                     SIM: odd clip currently in the scene
+        //   AUD TRIMSET ODD <db>             -> odd clip (ROUND/SIM)
+        //   AUD TRIMSET COMMON <db>          -> common clip (ROUND only)
+        //   AUD TRIMSET SLOT <pos> <db>      -> clip currently assigned to that speaker position
+        //
+        if (!g_audEnabled) audEnable(AUD_CLIP, 1);
+
+        // Tokenize the remainder (a2)
+        String t1 = firstToken(a2);
+        String rest = afterFirstToken(a2);
+        rest.trim();
+        String t1u = t1; t1u.toUpperCase();
+
+        uint16_t id = 0;
+        int db = 0;
+
+        if (t1.length() == 0) {
+          DBG_PRINTLN("Usage: AUD TRIMSET <db>  |  AUD TRIMSET ODD <db>  |  AUD TRIMSET COMMON <db>  |  AUD TRIMSET SLOT <pos> <db>");
+          return;
+        }
+
+        if (t1u == "SLOT") {
+          String posTok = firstToken(rest);
+          String dbTok  = afterFirstToken(rest);
+          dbTok.trim();
+          uint8_t pos;
+          if (!audParsePosToken(posTok, pos) || dbTok.length() == 0) {
+            DBG_PRINTLN("Usage: AUD TRIMSET SLOT A0..A3|B0..B3|0..7 <db>");
+            return;
+          }
+          id = audSceneIdAtPos(pos);
+          db = dbTok.toInt();
+        } else if (t1u == "ODD" || t1u == "COMMON") {
+          if (rest.length() == 0) {
+            DBG_PRINTLN("Usage: AUD TRIMSET ODD <db>  |  AUD TRIMSET COMMON <db>");
+            return;
+          }
+          db = rest.toInt();
+          if (t1u == "ODD") {
+            if (g_audMode == AUD_SIM) id = audSceneOddId();
+            else id = g_audOddId;
+          } else {
+            id = g_audCommonId;
+          }
+        } else {
+          // Assume t1 is a number (db).
+          db = t1.toInt();
+          if (g_audMode == AUD_CLIP) id = g_audClipId;
+          else if (g_audMode == AUD_ROUND) id = g_audOddId;
+          else id = audSceneOddId();
+        }
+
+        if (id == 0) {
+          DBG_PRINTLN("[AUD] TRIMSET target clip id=0 (slot empty or odd not found). Try AUD SHOW to see scene IDs.");
+          return;
+        }
+
+        audSetAdj(id, (int8_t)db);
+        audPrintClipMeta("TRIMSET", id);
+        DBG_PRINTF("[AUD] suggested_delta_db set to %d\n", (int)audGetAdj(id));
+        audApply();
+        return;
+      }
+
+      if (a1u == "EXPORT") {
+        audExport();
+        return;
+      }
+      if (a1u == "CLEARTRIM") {
+        audClearAdj();
+        DBG_PRINTLN("[AUD] cleared all suggested deltas");
+        if (g_audEnabled) audApply();
+        return;
+      }
+
+      if (a1u == "AUTO") {
+        // AUD AUTO           -> toggle
+        // AUD AUTO <ms>      -> set period + enable
+        if (!g_audEnabled) audEnable(AUD_CLIP, 1);
+        if (a2.length() == 0) {
+          g_audAuto = !g_audAuto;
+        } else {
+          uint32_t ms = (uint32_t)a2.toInt();
+          if (ms < 500) ms = 500;
+          g_audAutoPeriodMs = ms;
+          g_audAuto = true;
+        }
+        g_audNextAutoMs = millis() + g_audAutoPeriodMs;
+        DBG_PRINTF("[AUD] auto=%s period=%lums\n", g_audAuto?"ON":"OFF", (unsigned long)g_audAutoPeriodMs);
+        return;
+      }
+
+      if (a1u == "BASE" || a1u == "SUB" || a1u == "SUB2") {
+        String val = a2;
+        val.trim();
+        String valu = val; valu.toUpperCase();
+        if (valu == "CLEAR") val = "";
+
+        if (a1u == "BASE") g_audFilterBase = val;
+        else if (a1u == "SUB") g_audFilterSub = val;
+        else g_audFilterSub2 = val;
+
+        audEnsureCursorValid();
+        DBG_PRINTF("[AUD] filter updated: base='%s' sub='%s' sub2='%s'\n",
+                   g_audFilterBase.c_str(), g_audFilterSub.c_str(), g_audFilterSub2.c_str());
+        if (g_audEnabled) audApply();
+        return;
+      }
+
+      if (a1u == "CLEARFILTER") {
+        g_audFilterBase = "";
+        g_audFilterSub  = "";
+        g_audFilterSub2 = "";
+        audEnsureCursorValid();
+        DBG_PRINTLN("[AUD] filters cleared");
+        if (g_audEnabled) audApply();
+        return;
+      }
+
+      DBG_PRINTLN("AUD: unknown syntax. Type AUD for help.");
+      return;
+    }
+
     // MIXFIX ... (runtime RIGHT-channel de-mix)
     // Usage:
     //   MIXFIX                -> help
@@ -703,47 +1447,106 @@ static void handleLegacyLine(const String& rawLine) {
     }
   }
 
-  // Legacy commands are line-based to avoid accidental triggers from PMS traffic.
-  if (line.length() == 1) {
-    char c = line.charAt(0);
-    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+  // Manual tech commands (word-based).
+  // These intentionally avoid single-character commands to prevent accidental triggers.
+  {
+    String up2 = line;
+    up2.toUpperCase();
+    String cmd = firstToken(up2);
+    String args = afterFirstToken(line);
+    args.trim();
 
-    if (c == 's') {
-      startGameAtLevel(1);
+    // HELP
+    if (cmd == "HELP") {
+      Serial.println();
+      Serial.println("=== Seashells Master Serial Commands ===");
+      Serial.println("HELP");
+      Serial.println("START [1|2|3]         (or: START level=<1..3>)");
+      Serial.println("STOP                  (end game)");
+      Serial.println("OTA [A|B|BOTH]         (trigger Side OTA update)");
+      Serial.println("CHAN <1-13>            (set ESP-NOW channel, persist to NVS, reboot)");
+      Serial.println("INFO                   (print channel + discovered sides)");
+      Serial.println("DIAG ...               (audio diagnostic; type DIAG for help)");
+      Serial.println("AUD ...                (sound audition / QA; type AUD for help)");
+      Serial.println("MIXFIX ...             (MixFix control; type MIXFIX for help)");
+      Serial.println();
+      Serial.println("PMS protocol (incoming):");
+      Serial.println("  !PMS PING");
+      Serial.println("  !PMS START level=1");
+      Serial.println("  !PMS STOP");
+      Serial.println();
       return;
     }
-    if (c == 'e') {
+
+    // START [level]
+    if (cmd == "START") {
+      int level = 1;
+      if (args.length()) {
+        // Accept: START 2
+        //         START level=2
+        //         START LEVEL 2
+        int32_t lv = parseKeyInt(args, "level", -999);
+        if (lv != -999) {
+          level = (int)lv;
+        } else {
+          String aup = args; aup.toUpperCase();
+          if (aup.startsWith("LEVEL")) {
+            String rest = args.substring(5);
+            rest.trim();
+            level = rest.toInt();
+          } else {
+            level = args.toInt();
+          }
+        }
+      }
+      if (level < 1 || level > 3) {
+        Serial.println("Usage: START [1|2|3]   (or START level=<1..3>)");
+        return;
+      }
+      startGameAtLevel((uint8_t)level);
+      return;
+    }
+
+    // STOP / END
+    if (cmd == "STOP" || cmd == "END") {
       stopGameFromHost("stopped");
       return;
     }
-    if (c == 'u') {
-      DBG_PRINTLN("[Master] OTA both sides");
-      if (g_sideKnown[0]) {
-        cmdOtaUpdate(g_sideMac[0], OTA_URL_SIDE_BIN);
-      } else {
-        DBG_PRINTLN("[Master] Side A not discovered yet (no OTA)");
+
+    // OTA [A|B|BOTH]
+    if (cmd == "OTA") {
+      String t = args;
+      t.trim();
+      t.toUpperCase();
+      if (t.startsWith("SIDE")) {
+        t = t.substring(4);
+        t.trim();
       }
-      delay(200);
-      if (g_sideKnown[1]) {
-        cmdOtaUpdate(g_sideMac[1], OTA_URL_SIDE_BIN);
-      } else {
-        DBG_PRINTLN("[Master] Side B not discovered yet (no OTA)");
+
+      uint8_t mask = 0x03; // default BOTH
+      if (t.length() == 0 || t == "BOTH") mask = 0x03;
+      else if (t == "A") mask = 0x01;
+      else if (t == "B") mask = 0x02;
+      else {
+        Serial.println("Usage: OTA [A|B|BOTH]");
+        return;
       }
-      return;
-    }
-    if (c == 'a') {
-      if (g_sideKnown[0]) cmdOtaUpdate(g_sideMac[0], OTA_URL_SIDE_BIN);
-      else DBG_PRINTLN("[Master] Side A not discovered yet (no OTA)");
-      return;
-    }
-    if (c == 'b') {
-      if (g_sideKnown[1]) cmdOtaUpdate(g_sideMac[1], OTA_URL_SIDE_BIN);
-      else DBG_PRINTLN("[Master] Side B not discovered yet (no OTA)");
+
+      if (mask & 0x01) {
+        DBG_PRINTLN("[Master] OTA Side A");
+        if (g_sideKnown[0]) cmdOtaUpdate(g_sideMac[0], OTA_URL_SIDE_BIN);
+        else DBG_PRINTLN("[Master] Side A not discovered yet (no OTA)");
+        delay(120);
+      }
+      if (mask & 0x02) {
+        DBG_PRINTLN("[Master] OTA Side B");
+        if (g_sideKnown[1]) cmdOtaUpdate(g_sideMac[1], OTA_URL_SIDE_BIN);
+        else DBG_PRINTLN("[Master] Side B not discovered yet (no OTA)");
+      }
       return;
     }
   }
-
-  // Unknown legacy input: stay quiet in production
+// Unknown legacy input: stay quiet in production
   DBG_PRINT("Unknown legacy line: ");
   DBG_PRINTLN(rawLine);
 }
@@ -927,6 +1730,13 @@ static void cmdLedAllWhiteOne(const uint8_t mac[6]){
 static void cmdLedAllWhiteSoftOne(const uint8_t mac[6]){
   sendFramed(mac, LED_WHITE_SOFT, nullptr, 0);
 }
+
+static void cmdLedSolidSlotsSide(uint8_t sideId, const uint8_t slotColors[4]) {
+  if (sideId > 1 || !slotColors) return;
+  if (!g_sideKnown[sideId]) return;
+  sendFramed(g_sideMac[sideId], LED_SOLID_SLOTS, slotColors, 4);
+}
+
 
 static void cmdStartLoopAllOne(const uint8_t mac[6]){
   sendFramed(mac, START_LOOP_ALL, nullptr, 0);
@@ -1787,6 +2597,18 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
     // Put the side into game mode
     cmdGameModeOne(src, true);
 
+    // Auto-apply MixFix defaults whenever a Side says HELLO (boot/reboot).
+    // This ensures the fix is active after power cycles without requiring
+    // a manual serial command.
+#if AUTO_ENABLE_MIXFIX
+    if (assign <= 1) {
+      cmdMixFixSide(assign,
+                    (uint8_t)AUTO_ENABLE_MIXFIX_MASK,
+                    q12FromMilli(AUTO_ENABLE_MIXFIX_K_MILLI),
+                    q12FromMilli(AUTO_ENABLE_MIXFIX_M_MILLI));
+    }
+#endif
+
     // If we're mid-game, (re)send state ONLY when the Side likely just came online.
     // This avoids restarting audio/LEDs on every HELLO (e.g., when probing for discovery).
     if ((g_state == ANNOUNCE || g_state == WAIT) && assign <= 1) {
@@ -1812,6 +2634,14 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
       g_diagAdvanceRequested = true;
       return;
     }
+
+    // In AUD mode, button presses are used as control input (do NOT affect lives/score).
+    if (g_audEnabled) {
+      uint8_t slot = (uint8_t)(payload[1] & 3);
+      g_audBtnPos = (uint8_t)((sid * 4) + slot);
+      return;
+    }
+
 
     // Latch only the FIRST button press for the current round.
     //
@@ -1908,6 +2738,13 @@ void loop() {
     diagTick();
     return;
   }
+
+  // Sound audition / QA mode (browsing clips + simulating rounds)
+  if (g_audEnabled) {
+    audTick();
+    return;
+  }
+
 
   switch (g_state) {
     case IDLE:
