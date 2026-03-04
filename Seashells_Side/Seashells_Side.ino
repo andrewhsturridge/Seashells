@@ -25,7 +25,7 @@
 #include "OtaUpdate.h"
 
 // Master trim for this side (in dB). Use 0 for unity, negatives to reduce.
-#define MASTER_GAIN_DB -20
+#define MASTER_GAIN_DB -10
 
 // ======= RGB setup =======
 #define NUM_LEDS_PER  1
