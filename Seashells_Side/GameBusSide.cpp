@@ -33,7 +33,9 @@ extern void side_stopAll();
 // Arduino loop via GameBus_pump().
 // ─────────────────────────────────────────────────────────────────────────────
 
-static constexpr uint8_t kCmdQSize      = 16;
+// Increase queue size: helps avoid dropping critical commands (SET_SCENE / START_LOOP_ALL)
+// during short bursts (ANNOUNCE -> WAIT) when ESP-NOW packets arrive back-to-back.
+static constexpr uint8_t kCmdQSize      = 32;
 static constexpr uint8_t kCmdMaxPayload = 210; // enough for OTA url packets
 
 static const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
@@ -46,6 +48,13 @@ static constexpr const char* kKeyMasterMac = "m_mac";  // 6 bytes
 static uint8_t  s_nowChannel = NOW_DEFAULT_CHANNEL;
 static uint8_t  s_masterMac[6] = {0};
 static bool     s_masterKnown  = false;
+
+// Tracks whether the Master currently *expects* looping audio to be running.
+// This makes the Side resilient to ESP-NOW packet reordering:
+//   - If START_LOOP_ALL arrives first, then SET_SCENE arrives later,
+//     SET_SCENE would otherwise reset channels to IDLE → silence.
+//   - With this flag, a late SET_SCENE will automatically re-start looping.
+static bool     s_expectLooping = false;
 
 // Remember last "HELLO" pool counts so we can answer HELLO_REQ even if the
 // main sketch only sent HELLO once at boot.
@@ -438,8 +447,14 @@ void GameBus_pump() {
 
 // Default mappings to the .ino functions
 void GB_onSetScene(uint16_t ids[4]) {
-  side_ledAllWhite();
   side_setScene(ids);
+
+  // If the Master already told us to loop audio (START_LOOP_ALL) and packets were reordered,
+  // SET_SCENE might arrive AFTER START_LOOP_ALL. SET_SCENE resets channels to IDLE, so we
+  // must re-assert looping here to avoid intermittent silence.
+  if (s_expectLooping) {
+    side_startLoopAll();
+  }
 }
 
 void GB_onBlinkSlots(const uint8_t slotColors[4], uint16_t on_ms, uint16_t off_ms) {
@@ -493,7 +508,11 @@ void GB_onBlinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms) {
 }
 void GB_onGameMode(bool enabled) { side_setGameMode(enabled); }
 void GB_onStartLoopAll() {
+  s_expectLooping = true;
   side_ledAllWhite();
   side_startLoopAll();
 }
-void GB_onStopAll() { side_stopAll(); }
+void GB_onStopAll() {
+  s_expectLooping = false;
+  side_stopAll();
+}

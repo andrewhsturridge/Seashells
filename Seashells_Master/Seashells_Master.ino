@@ -233,6 +233,15 @@ static constexpr uint32_t LED_WHITE_RETRY_GAP_MS         = 250;
 static uint8_t  g_ledWhiteRetries = 0;
 static uint32_t g_ledWhiteRetryAtMs = 0;
 
+// AUDIO reliability: resend START_LOOP_ALL a couple times at the start of each WAIT phase.
+// This fixes intermittent "one side silent" cases caused by ESP-NOW packet loss/reordering.
+// The Side firmware makes START_LOOP_ALL idempotent (won't restart if already looping).
+static constexpr uint8_t  AUDIO_START_RETRY_COUNT          = 4;
+static constexpr uint32_t AUDIO_START_RETRY_FIRST_DELAY_MS = 160;
+static constexpr uint32_t AUDIO_START_RETRY_GAP_MS         = 260;
+static uint8_t  g_audioStartRetries = 0;
+static uint32_t g_audioStartRetryAtMs = 0;
+
 // Current scene + odd markers
 static uint16_t sceneA[4] {0,0,0,0};
 static uint16_t sceneB[4] {0,0,0,0};
@@ -415,6 +424,8 @@ static void startGameAtLevel(uint8_t level) {
 
   // Cancel any pending LED retries from a previous run
   g_ledWhiteRetries = 0;
+  // Cancel any pending audio retries from a previous run
+  g_audioStartRetries = 0;
 
   // Enter active state machine
   cmdLedAllWhite();
@@ -435,6 +446,7 @@ static void stopGameFromHost(const char* reason) {
 
   cmdStopAll();
   g_ledWhiteRetries = 0;
+  g_audioStartRetries = 0;
   g_state = IDLE;
   DBG_PRINTLN("[Master] Game ended -> IDLE");
 
@@ -2777,6 +2789,11 @@ void loop() {
     }
 
     case ANNOUNCE:
+      // Re-send scenes right before starting audio (extra redundancy).
+      // This helps if SET_SCENE was dropped earlier during BUILD.
+      cmdSetSceneSide(0, sceneA);
+      cmdSetSceneSide(1, sceneB);
+
       // Re-send trims right before starting audio (extra redundancy).
       cmdApplyAudioMitigationForRound();
       cmdStartLoopAll();
@@ -2786,6 +2803,10 @@ void loop() {
       // Retry LED_ALL_WHITE a couple times shortly after entering WAIT.
       g_ledWhiteRetries  = LED_WHITE_RETRY_COUNT;
       g_ledWhiteRetryAtMs = g_waitStartMs + LED_WHITE_RETRY_FIRST_DELAY_MS;
+
+      // Retry START_LOOP_ALL a few times shortly after entering WAIT.
+      g_audioStartRetries  = AUDIO_START_RETRY_COUNT;
+      g_audioStartRetryAtMs = g_waitStartMs + AUDIO_START_RETRY_FIRST_DELAY_MS;
       DBG_PRINTLN("[Master] ANNOUNCE -> WAIT");
       g_state = WAIT;
       break;
@@ -2802,10 +2823,24 @@ void loop() {
         }
       }
 
+      // Reliability: resend START_LOOP_ALL a couple times right after entering WAIT.
+      // This fixes cases where one Side never started audio (packet loss/reorder).
+      if (g_audioStartRetries && lastSide == 255) {
+        const uint32_t nowMs = millis();
+        if ((int32_t)(nowMs - g_audioStartRetryAtMs) >= 0) {
+          // Re-send trims before re-starting (keeps mitigation consistent).
+          cmdApplyAudioMitigationForRound();
+          cmdStartLoopAll();
+          g_audioStartRetries--;
+          g_audioStartRetryAtMs = nowMs + AUDIO_START_RETRY_GAP_MS;
+        }
+      }
+
       // TIMEOUT = lose a life
       if (millis() - g_waitStartMs > g_curTimeoutMs) {
         cmdStopAll();
         g_ledWhiteRetries = 0;
+        g_audioStartRetries = 0;
         if (g_lives > 0) g_lives--;
         DBG_PRINTF("[Master] TIMEOUT -> LIFE LOST (lives=%u)\n", (unsigned)g_lives);
 
@@ -2833,6 +2868,7 @@ void loop() {
         DBG_PRINTF("[Master] PICK side=%u slot=%u\n", lastSide, lastSlot);
         cmdStopAll();
         g_ledWhiteRetries = 0;
+        g_audioStartRetries = 0;
 
         bool correct = (lastSide==0) ? slotIsOdd_A[lastSlot & 3]
                                      : slotIsOdd_B[lastSlot & 3];

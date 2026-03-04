@@ -699,6 +699,11 @@ void side_setGameMode(bool en){ gameMode=en; }
 void side_startLoopAll(){
   if (diagAudioActive) return;
   for (int i=0;i<4;i++){
+    // IMPORTANT: make this command idempotent.
+    // We often resend START_LOOP_ALL from the Master for reliability (ESP-NOW can drop/reorder).
+    // If a channel is *already looping*, do NOT restart it (avoid audible restart/glitch).
+    if (ch[i].state == LOOPING) continue;
+
     ch[i].state = LOOPING;
     ch[i].idx = 0;
     if (ch[i].isTone && ch[i].toneMode != TONE_NONE) {
