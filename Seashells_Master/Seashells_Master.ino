@@ -216,6 +216,21 @@ static ClipAdj g_audAdj[128];
 static size_t  g_audAdjCount = 0;
 
 
+// AUD scene-push reliability:
+// AUD mode changes clips on demand, so we do a small follow-up retry burst
+// after each apply. This fixes the common ESP-NOW failure mode where one Side
+// misses SET_SCENE or START_LOOP_ALL and keeps the old clip (or stays silent).
+static constexpr uint8_t  AUD_PUSH_RETRY_COUNT          = 3;
+static constexpr uint32_t AUD_PUSH_RETRY_FIRST_DELAY_MS = 70;
+static constexpr uint32_t AUD_PUSH_RETRY_GAP_MS         = 90;
+static uint8_t  g_audRetryLedA[4]  = {3,3,3,3};
+static uint8_t  g_audRetryLedB[4]  = {3,3,3,3};
+static int8_t   g_audRetryTrimA[4] = {0,0,0,0};
+static int8_t   g_audRetryTrimB[4] = {0,0,0,0};
+static uint8_t  g_audPushRetries   = 0;
+static uint32_t g_audPushRetryAtMs = 0;
+
+
 // Pause bookkeeping
 static uint32_t resultPauseUntil = 0;
 static State    nextAfterBlink   = IDLE;
@@ -232,15 +247,6 @@ static constexpr uint32_t LED_WHITE_RETRY_FIRST_DELAY_MS = 120;
 static constexpr uint32_t LED_WHITE_RETRY_GAP_MS         = 250;
 static uint8_t  g_ledWhiteRetries = 0;
 static uint32_t g_ledWhiteRetryAtMs = 0;
-
-// AUDIO reliability: resend START_LOOP_ALL a couple times at the start of each WAIT phase.
-// This fixes intermittent "one side silent" cases caused by ESP-NOW packet loss/reordering.
-// The Side firmware makes START_LOOP_ALL idempotent (won't restart if already looping).
-static constexpr uint8_t  AUDIO_START_RETRY_COUNT          = 4;
-static constexpr uint32_t AUDIO_START_RETRY_FIRST_DELAY_MS = 160;
-static constexpr uint32_t AUDIO_START_RETRY_GAP_MS         = 260;
-static uint8_t  g_audioStartRetries = 0;
-static uint32_t g_audioStartRetryAtMs = 0;
 
 // Current scene + odd markers
 static uint16_t sceneA[4] {0,0,0,0};
@@ -424,8 +430,6 @@ static void startGameAtLevel(uint8_t level) {
 
   // Cancel any pending LED retries from a previous run
   g_ledWhiteRetries = 0;
-  // Cancel any pending audio retries from a previous run
-  g_audioStartRetries = 0;
 
   // Enter active state machine
   cmdLedAllWhite();
@@ -446,7 +450,6 @@ static void stopGameFromHost(const char* reason) {
 
   cmdStopAll();
   g_ledWhiteRetries = 0;
-  g_audioStartRetries = 0;
   g_state = IDLE;
   DBG_PRINTLN("[Master] Game ended -> IDLE");
 
@@ -695,29 +698,52 @@ static void audComputeSolidLeds(uint8_t ledA[4], uint8_t ledB[4]) {
   }
 }
 
-static void audPushSceneToSides(const uint8_t ledA[4], const uint8_t ledB[4]) {
+
+static void audSendSceneToSidesNow(const uint8_t ledA[4], const uint8_t ledB[4],
+                                   const int8_t trimA[4], const int8_t trimB[4],
+                                   bool includeStop, bool includeStart) {
   // Ensure sides don't locally play on press (we want BTN_EVENTs for control).
   cmdGameMode(true);
 
-  // Stop previous audio, then push the new scene.
-  cmdStopAll();
+  if (includeStop) cmdStopAll();
+
+  // Push scene + trims. Re-sending these is safe and is what recovers a Side
+  // that missed one packet and would otherwise keep an old clip or go silent.
   cmdSetSceneSide(0, sceneA);
   cmdSetSceneSide(1, sceneB);
+  cmdSetSlotTrimSide(0, trimA);
+  cmdSetSlotTrimSide(1, trimB);
 
+  // Start once initially, then also on follow-up retries. The Side now treats
+  // START_LOOP_ALL as idempotent, so retries won't rewind already-playing clips.
+  if (includeStart) cmdStartLoopAll();
+
+  // In AUD we want deterministic solid LEDs instead of whatever the normal
+  // start path chooses.
+  cmdLedSolidSlotsSide(0, ledA);
+  cmdLedSolidSlotsSide(1, ledB);
+}
+
+static void audPushSceneToSides(const uint8_t ledA[4], const uint8_t ledB[4]) {
   // Apply per-clip trim suggestions as per-slot trims (audition only).
   int8_t tA[4] = {0,0,0,0};
   int8_t tB[4] = {0,0,0,0};
   for (int i=0;i<4;i++){
     if (sceneA[i]) tA[i] = audGetAdj(sceneA[i]);
     if (sceneB[i]) tB[i] = audGetAdj(sceneB[i]);
+    g_audRetryLedA[i]  = ledA[i];
+    g_audRetryLedB[i]  = ledB[i];
+    g_audRetryTrimA[i] = tA[i];
+    g_audRetryTrimB[i] = tB[i];
   }
-  cmdSetSlotTrimSide(0, tA);
-  cmdSetSlotTrimSide(1, tB);
 
-  // Start loops (Sides will set LEDs white). Then override to our solid map.
-  cmdStartLoopAll();
-  cmdLedSolidSlotsSide(0, ledA);
-  cmdLedSolidSlotsSide(1, ledB);
+  // First push: stop the old scene, send the new one, then start it.
+  audSendSceneToSidesNow(ledA, ledB, tA, tB, /*includeStop*/true, /*includeStart*/true);
+
+  // Follow-up retries use the *latest* scene and make AUD NEXT/PREV much more
+  // reliable over ESP-NOW.
+  g_audPushRetries   = AUD_PUSH_RETRY_COUNT;
+  g_audPushRetryAtMs = millis() + AUD_PUSH_RETRY_FIRST_DELAY_MS;
 }
 
 static void audPrintState() {
@@ -827,6 +853,7 @@ static void audDisable() {
   g_audEnabled = false;
   g_audAuto = false;
   g_audBtnPos = 255;
+  g_audPushRetries = 0;
 
   cmdStopAll();
   // Clear trims so gameplay isn't affected later.
@@ -865,6 +892,18 @@ static void audStep(int dir) {
 static void audTick() {
   if (!g_audEnabled) return;
 
+  // Reliability retries for the most recent AUD scene push.
+  const uint32_t nowMs = millis();
+  if (g_audPushRetries && (int32_t)(nowMs - g_audPushRetryAtMs) >= 0) {
+    audSendSceneToSidesNow(g_audRetryLedA, g_audRetryLedB,
+                           g_audRetryTrimA, g_audRetryTrimB,
+                           /*includeStop*/false, /*includeStart*/true);
+    g_audPushRetries--;
+    if (g_audPushRetries) {
+      g_audPushRetryAtMs = nowMs + AUD_PUSH_RETRY_GAP_MS;
+    }
+  }
+
   // Button-driven control (from BTN_EVENT).
   if (g_audBtnPos != 255) {
     uint8_t pos = g_audBtnPos;
@@ -884,7 +923,6 @@ static void audTick() {
 
   // Optional auto-step.
   if (g_audAuto) {
-    const uint32_t nowMs = millis();
     if ((int32_t)(nowMs - g_audNextAutoMs) >= 0) {
       g_audNextAutoMs = nowMs + g_audAutoPeriodMs;
       audStep(+1);
@@ -2789,11 +2827,6 @@ void loop() {
     }
 
     case ANNOUNCE:
-      // Re-send scenes right before starting audio (extra redundancy).
-      // This helps if SET_SCENE was dropped earlier during BUILD.
-      cmdSetSceneSide(0, sceneA);
-      cmdSetSceneSide(1, sceneB);
-
       // Re-send trims right before starting audio (extra redundancy).
       cmdApplyAudioMitigationForRound();
       cmdStartLoopAll();
@@ -2803,10 +2836,6 @@ void loop() {
       // Retry LED_ALL_WHITE a couple times shortly after entering WAIT.
       g_ledWhiteRetries  = LED_WHITE_RETRY_COUNT;
       g_ledWhiteRetryAtMs = g_waitStartMs + LED_WHITE_RETRY_FIRST_DELAY_MS;
-
-      // Retry START_LOOP_ALL a few times shortly after entering WAIT.
-      g_audioStartRetries  = AUDIO_START_RETRY_COUNT;
-      g_audioStartRetryAtMs = g_waitStartMs + AUDIO_START_RETRY_FIRST_DELAY_MS;
       DBG_PRINTLN("[Master] ANNOUNCE -> WAIT");
       g_state = WAIT;
       break;
@@ -2823,24 +2852,10 @@ void loop() {
         }
       }
 
-      // Reliability: resend START_LOOP_ALL a couple times right after entering WAIT.
-      // This fixes cases where one Side never started audio (packet loss/reorder).
-      if (g_audioStartRetries && lastSide == 255) {
-        const uint32_t nowMs = millis();
-        if ((int32_t)(nowMs - g_audioStartRetryAtMs) >= 0) {
-          // Re-send trims before re-starting (keeps mitigation consistent).
-          cmdApplyAudioMitigationForRound();
-          cmdStartLoopAll();
-          g_audioStartRetries--;
-          g_audioStartRetryAtMs = nowMs + AUDIO_START_RETRY_GAP_MS;
-        }
-      }
-
       // TIMEOUT = lose a life
       if (millis() - g_waitStartMs > g_curTimeoutMs) {
         cmdStopAll();
         g_ledWhiteRetries = 0;
-        g_audioStartRetries = 0;
         if (g_lives > 0) g_lives--;
         DBG_PRINTF("[Master] TIMEOUT -> LIFE LOST (lives=%u)\n", (unsigned)g_lives);
 
@@ -2868,7 +2883,6 @@ void loop() {
         DBG_PRINTF("[Master] PICK side=%u slot=%u\n", lastSide, lastSlot);
         cmdStopAll();
         g_ledWhiteRetries = 0;
-        g_audioStartRetries = 0;
 
         bool correct = (lastSide==0) ? slotIsOdd_A[lastSlot & 3]
                                      : slotIsOdd_B[lastSlot & 3];

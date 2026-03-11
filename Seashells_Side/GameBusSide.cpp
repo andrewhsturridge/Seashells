@@ -33,8 +33,6 @@ extern void side_stopAll();
 // Arduino loop via GameBus_pump().
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Increase queue size: helps avoid dropping critical commands (SET_SCENE / START_LOOP_ALL)
-// during short bursts (ANNOUNCE -> WAIT) when ESP-NOW packets arrive back-to-back.
 static constexpr uint8_t kCmdQSize      = 32;
 static constexpr uint8_t kCmdMaxPayload = 210; // enough for OTA url packets
 
@@ -49,17 +47,14 @@ static uint8_t  s_nowChannel = NOW_DEFAULT_CHANNEL;
 static uint8_t  s_masterMac[6] = {0};
 static bool     s_masterKnown  = false;
 
-// Tracks whether the Master currently *expects* looping audio to be running.
-// This makes the Side resilient to ESP-NOW packet reordering:
-//   - If START_LOOP_ALL arrives first, then SET_SCENE arrives later,
-//     SET_SCENE would otherwise reset channels to IDLE → silence.
-//   - With this flag, a late SET_SCENE will automatically re-start looping.
-static bool     s_expectLooping = false;
-
 // Remember last "HELLO" pool counts so we can answer HELLO_REQ even if the
 // main sketch only sent HELLO once at boot.
 static uint16_t s_poolA_last = 0;
 static uint16_t s_poolB_last = 0;
+
+// Tracks whether the Master expects audio to be looping right now.
+// This lets us recover if SET_SCENE arrives after START_LOOP_ALL.
+static bool     s_expectLooping = false;
 
 static inline bool macIsAllZero(const uint8_t mac[6]) {
   for (int i=0;i<6;i++) if (mac[i] != 0) return false;
@@ -449,9 +444,9 @@ void GameBus_pump() {
 void GB_onSetScene(uint16_t ids[4]) {
   side_setScene(ids);
 
-  // If the Master already told us to loop audio (START_LOOP_ALL) and packets were reordered,
-  // SET_SCENE might arrive AFTER START_LOOP_ALL. SET_SCENE resets channels to IDLE, so we
-  // must re-assert looping here to avoid intermittent silence.
+  // If the Master already told us to loop audio and packets were reordered,
+  // SET_SCENE may arrive AFTER START_LOOP_ALL. side_setScene() resets channels
+  // to IDLE, so re-assert looping here to avoid intermittent wrong/old/silent audio.
   if (s_expectLooping) {
     side_startLoopAll();
   }
@@ -508,8 +503,14 @@ void GB_onBlinkAll(uint8_t color, uint16_t on_ms, uint16_t off_ms) {
 }
 void GB_onGameMode(bool enabled) { side_setGameMode(enabled); }
 void GB_onStartLoopAll() {
+  const bool wasExpecting = s_expectLooping;
   s_expectLooping = true;
-  side_ledAllWhite();
+
+  // Only force white on the *first* start. Repeated START_LOOP_ALL packets are
+  // used for reliability and should not keep flashing white over audition LEDs.
+  if (!wasExpecting) {
+    side_ledAllWhite();
+  }
   side_startLoopAll();
 }
 void GB_onStopAll() {
