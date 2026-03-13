@@ -248,6 +248,19 @@ static constexpr uint32_t LED_WHITE_RETRY_GAP_MS         = 250;
 static uint8_t  g_ledWhiteRetries = 0;
 static uint32_t g_ledWhiteRetryAtMs = 0;
 
+// Round-start audio reliability:
+// With PMS_DEBUG_SERIAL=0 the Master can emit BUILD/ANNOUNCE ESP-NOW packets
+// in a very tight burst. On some installs that makes one Side miss SET_SCENE
+// or START_LOOP_ALL. AUD mode already compensates with timed retries; do the
+// same for normal gameplay so debug prints are no longer acting as accidental
+// pacing.
+static constexpr uint8_t  ROUND_PUSH_RETRY_COUNT          = 3;
+static constexpr uint32_t ROUND_PUSH_RETRY_FIRST_DELAY_MS = 70;
+static constexpr uint32_t ROUND_PUSH_RETRY_GAP_MS         = 90;
+static constexpr uint16_t ROUND_PUSH_PACE_MS              = 8;
+static uint8_t  g_roundPushRetries = 0;
+static uint32_t g_roundPushRetryAtMs = 0;
+
 // Current scene + odd markers
 static uint16_t sceneA[4] {0,0,0,0};
 static uint16_t sceneB[4] {0,0,0,0};
@@ -291,6 +304,11 @@ static String g_serialLine;
 static void cmdLedAllWhite();
 static void cmdStopAll();
 static void cmdOtaUpdate(const uint8_t mac[6], const char* url);
+
+// Forward declarations for round-start reliability helpers
+static inline void gameClearRoundPushRetries();
+static void gamePushSceneToSidesNow(bool includeWhite);
+static inline void gameScheduleRoundPushRetries();
 
 // =============================================================
 // ESP-NOW network state (declared early so serial handlers compile)
@@ -428,8 +446,9 @@ static void startGameAtLevel(uint8_t level) {
   // Clear pick latch
   lastSide = lastSlot = 255;
 
-  // Cancel any pending LED retries from a previous run
+  // Cancel any pending reliability retries from a previous run
   g_ledWhiteRetries = 0;
+  gameClearRoundPushRetries();
 
   // Enter active state machine
   cmdLedAllWhite();
@@ -450,6 +469,7 @@ static void stopGameFromHost(const char* reason) {
 
   cmdStopAll();
   g_ledWhiteRetries = 0;
+  gameClearRoundPushRetries();
   g_state = IDLE;
   DBG_PRINTLN("[Master] Game ended -> IDLE");
 
@@ -744,6 +764,36 @@ static void audPushSceneToSides(const uint8_t ledA[4], const uint8_t ledB[4]) {
   // reliable over ESP-NOW.
   g_audPushRetries   = AUD_PUSH_RETRY_COUNT;
   g_audPushRetryAtMs = millis() + AUD_PUSH_RETRY_FIRST_DELAY_MS;
+}
+
+// Normal game round-start push with small pacing gaps.
+// This intentionally mirrors the AUD reliability approach, but keeps LEDs
+// separate so the existing soft-white retry path still avoids flicker.
+static inline void gameClearRoundPushRetries() {
+  g_roundPushRetries = 0;
+  g_roundPushRetryAtMs = 0;
+}
+
+static void gamePushSceneToSidesNow(bool includeWhite) {
+  cmdSetSceneSide(0, sceneA);
+  delay(ROUND_PUSH_PACE_MS);
+  cmdSetSceneSide(1, sceneB);
+  delay(ROUND_PUSH_PACE_MS);
+
+  cmdApplyAudioMitigationForRound();
+  delay(ROUND_PUSH_PACE_MS);
+
+  cmdStartLoopAll();
+
+  if (includeWhite) {
+    delay(ROUND_PUSH_PACE_MS);
+    cmdLedAllWhite();
+  }
+}
+
+static inline void gameScheduleRoundPushRetries() {
+  g_roundPushRetries = ROUND_PUSH_RETRY_COUNT;
+  g_roundPushRetryAtMs = millis() + ROUND_PUSH_RETRY_FIRST_DELAY_MS;
 }
 
 static void audPrintState() {
@@ -2159,6 +2209,7 @@ static void diagTick() {
 
 static void endGame() {
   cmdStopAll();
+  gameClearRoundPushRetries();
   g_state = IDLE;
   DBG_PRINTLN("[Master] Game ended -> IDLE");
 }
@@ -2187,21 +2238,27 @@ static void printIdInfo(const char* label, uint16_t id) {
 // Some clips exist on the SD card / manifest but should never be used in gameplay.
 // (Requested: remove thunder from Halloween sounds; remove walking-in-snow.)
 static bool isExcludedClip(const MasterClipMeta& m) {
-  // Exclude "thunder" within Halloween occasion set
-  if (strcasecmp(m.base, "occassions") == 0 &&
-      strcasecmp(m.sub,  "halloween")  == 0 &&
-      strcasecmp(m.sub2, "thunder")    == 0) {
-    return true;
-  }
+  switch (m.id) {
+    // Halloween thunder
+    case 6006:
+    case 6007:
+    case 6008:
 
-  // Exclude "walkinginsnow" within Christmas occasion set
-  if (strcasecmp(m.base, "occassions") == 0 &&
-      strcasecmp(m.sub,  "christmas")  == 0 &&
-      strcasecmp(m.sub2, "walkinginsnow") == 0) {
-    return true;
-  }
+    // Christmas walking-in-snow
+    case 6104:
+    case 6105:
+    case 6106:
 
-  return false;
+    // Additional requested exclusions
+    case 1102:
+    case 1108:
+    case 5201:
+    case 5202:
+      return true;
+
+    default:
+      return false;
+  }
 }
 
 // Fallback: pick any non-excluded clip ID (guarded)
@@ -2812,9 +2869,13 @@ void loop() {
         DBG_PRINTLN("[Master] Using Level 3 (round 3 - infinite)");
       }
 
-      // Send the new scenes to each Side (unicast once each Side is discovered)
+      // Send the new scenes to each Side (unicast once each Side is discovered).
+      // Add a tiny pacing gap so we don't blast both packets back-to-back.
+      gameClearRoundPushRetries();
       cmdSetSceneSide(0, sceneA);
+      delay(ROUND_PUSH_PACE_MS);
       cmdSetSceneSide(1, sceneB);
+      delay(ROUND_PUSH_PACE_MS);
 
       // Optional software mitigation / diagnostic trims (sent every round so
       // Sides don't get stuck with stale trims if a packet was dropped).
@@ -2827,20 +2888,33 @@ void loop() {
     }
 
     case ANNOUNCE:
-      // Re-send trims right before starting audio (extra redundancy).
-      cmdApplyAudioMitigationForRound();
-      cmdStartLoopAll();
-      cmdLedAllWhite();
+      // Push the current round again with pacing. When debug Serial is OFF this
+      // prevents one Side from missing SET_SCENE/START due to a too-tight burst.
+      gamePushSceneToSidesNow(/*includeWhite*/true);
       lastSide = lastSlot = 255;
       g_waitStartMs = millis();
       // Retry LED_ALL_WHITE a couple times shortly after entering WAIT.
       g_ledWhiteRetries  = LED_WHITE_RETRY_COUNT;
       g_ledWhiteRetryAtMs = g_waitStartMs + LED_WHITE_RETRY_FIRST_DELAY_MS;
+      // Also retry scene/start a few times during the first few hundred ms.
+      gameScheduleRoundPushRetries();
       DBG_PRINTLN("[Master] ANNOUNCE -> WAIT");
       g_state = WAIT;
       break;
 
     case WAIT: {
+      // Reliability: resend scene/start a few times right after entering WAIT.
+      // This fixes the "works only when debug serial is on" symptom where the
+      // initial burst is too fast and a Side misses SET_SCENE or START_LOOP_ALL.
+      if (g_roundPushRetries && lastSide == 255) {
+        const uint32_t nowMs = millis();
+        if ((int32_t)(nowMs - g_roundPushRetryAtMs) >= 0) {
+          gamePushSceneToSidesNow(/*includeWhite*/false);
+          g_roundPushRetries--;
+          g_roundPushRetryAtMs = nowMs + ROUND_PUSH_RETRY_GAP_MS;
+        }
+      }
+
       // Reliability: resend LED_ALL_WHITE a couple times right after entering WAIT.
       // This helps if a single ESP-NOW packet was missed (no longer relying on HELLO spam).
       if (g_ledWhiteRetries && lastSide == 255) {
@@ -2856,6 +2930,7 @@ void loop() {
       if (millis() - g_waitStartMs > g_curTimeoutMs) {
         cmdStopAll();
         g_ledWhiteRetries = 0;
+        gameClearRoundPushRetries();
         if (g_lives > 0) g_lives--;
         DBG_PRINTF("[Master] TIMEOUT -> LIFE LOST (lives=%u)\n", (unsigned)g_lives);
 
@@ -2883,6 +2958,7 @@ void loop() {
         DBG_PRINTF("[Master] PICK side=%u slot=%u\n", lastSide, lastSlot);
         cmdStopAll();
         g_ledWhiteRetries = 0;
+        gameClearRoundPushRetries();
 
         bool correct = (lastSide==0) ? slotIsOdd_A[lastSlot & 3]
                                      : slotIsOdd_B[lastSlot & 3];

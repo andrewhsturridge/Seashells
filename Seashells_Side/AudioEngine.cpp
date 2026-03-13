@@ -627,7 +627,7 @@ void i2s_init_common(i2s_port_t port, int dout, int bclk, int lrck) {
 // Suggested bounds: keep per-clip volume_db within roughly [-40, +36].
 // Going higher will usually just hard-clip.
 
-static constexpr int8_t kMaxBoostDb = 36;  // clamp positive dB to keep numbers sane
+static constexpr int8_t kMaxBoostDb = 40;  // clamp positive dB to keep numbers sane
 
 int32_t q15_from_db(int8_t db) {
   if (db > kMaxBoostDb) db = kMaxBoostDb;
