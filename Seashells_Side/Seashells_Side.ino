@@ -27,6 +27,10 @@
 // Master trim for this side (in dB). Use 0 for unity, negatives to reduce.
 #define MASTER_GAIN_DB -10
 
+// Extra gain for the synthesized low beep (id=5001).
+// This sits on top of MASTER_GAIN_DB and any manifest volume_db.
+static constexpr int8_t LOW_BEEP_EXTRA_GAIN_DB = 6;
+
 // ======= RGB setup =======
 #define NUM_LEDS_PER  1
 Adafruit_NeoPixel rgb1(NUM_LEDS_PER, RGB1_PIN, NEO_GRB + NEO_KHZ800);
@@ -352,6 +356,9 @@ void side_setScene(uint16_t ids[4]) {
 
     // Compute per-clip gain: master * per-clip (dB -> Q15)
     int32_t clipQ = q15_from_db(cm->volume_db);
+    if (cm->id == 5001) {
+      clipQ = q15_mul(clipQ, q15_from_db(LOW_BEEP_EXTRA_GAIN_DB));
+    }
     baseGainQ15[i] = q15_mul(masterGainQ15, clipQ);
     ch[i].gainQ15  = q15_mul(baseGainQ15[i], slotTrimQ15[i]);
 

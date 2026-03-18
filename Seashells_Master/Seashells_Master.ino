@@ -11,15 +11,15 @@
 //
 //   PMS -> Master:
 //     !PMS PING
-//     !PMS START level=1        (level 1..3; default 1)
+//     !PMS START level=1        (level 1..4; default 1)
 //     !PMS STOP
 //
 //   Master -> PMS:
 //     !PMS PONG v=1 game=seashells role=server
-//     !PMS STATUS v=1 state=arming|playing level=1|2|3 score=.. lives=.. tleft_ms=.. last_reason=..
+//     !PMS STATUS v=1 state=arming|playing level=1|2|3|4 score=.. lives=.. tleft_ms=.. last_reason=..
 //       (STATUS prints every 250ms while active; NOT emitted while idle)
 //     !PMS EVENT v=1 name=game_start level=1
-//     !PMS EVENT v=1 name=game_end reason=timeup|no_lives|stopped score=.. lives=..
+//     !PMS EVENT v=1 name=game_end reason=success|no_lives|stopped score=.. lives=..
 //     !PMS EVENT v=1 name=score delta=1 total=.. bonus=0
 //     !PMS EVENT v=1 name=life delta=-1 lives=..
 //
@@ -32,7 +32,7 @@
 //   - Commands are LINE-based and WORD-based to prevent accidental triggers.
 //   - Type: HELP
 //   - Common commands:
-//       START [1|2|3]      (or START level=<1..3>)
+//       START [1|2|3|4]      (or START level=<1..4>)
 //       STOP              (end game)
 //       OTA [A|B|BOTH]     (push Side OTA URL)
 //       CHAN <1-13>        (set ESP-NOW channel + reboot)
@@ -91,10 +91,15 @@
 
 
 // ---------- Tuning ----------
-static const uint32_t BASE_TIMEOUT_MS[3] = {
-  45000,  // Round 1 base: 45s
-  40000,  // Round 2 base: 40s
-  35000   // Round 3 base: 35s
+static constexpr uint8_t  SEASHELLS_LEVEL_COUNT      = 4;
+static constexpr uint8_t  SEASHELLS_LAST_LEVEL_INDEX = SEASHELLS_LEVEL_COUNT - 1;
+static constexpr uint8_t  CORRECT_PICKS_TO_ADVANCE   = 5;
+static constexpr uint32_t GAME_SUCCESS_PLAY_MS       = 300000UL; // 5:00 overall success timer
+static const uint32_t BASE_TIMEOUT_MS[SEASHELLS_LEVEL_COUNT] = {
+  45000,  // Level 1 base: 45s (new identical-common opener)
+  45000,  // Level 2 base: 45s (previous Level 1)
+  40000,  // Level 3 base: 40s (previous Level 2)
+  35000   // Level 4 base: 35s (previous Level 3 / indefinite)
 };
 static const float   TIME_DECAY_FACTOR = 0.8f;   // each correct: timeout *= 0.8
 static const uint32_t MIN_TIMEOUT_MS   = 5000;   // never go below 5 seconds
@@ -178,7 +183,7 @@ static volatile bool g_diagAdvanceRequested = false;
 // Usage (Serial, line-based):
 //   AUD              -> help
 //   AUD ON|OFF       -> enter/exit audition mode
-//   AUD MODE CLIP|ROUND|SIM1|SIM2|SIM3
+//   AUD MODE CLIP|ROUND|SIM1|SIM2|SIM3|SIM4
 //   AUD NEXT|PREV    -> step through clips / scenes (depends on mode)
 //   AUD SOLOPOS <A0..A3|B0..B3|0..7>   (CLIP mode output speaker)
 //   AUD ODDPOS  <A0..A3|B0..B3|0..7>   (ROUND mode odd speaker position)
@@ -191,7 +196,7 @@ static volatile bool g_diagAdvanceRequested = false;
 enum AudMode : uint8_t { AUD_OFF=0, AUD_CLIP=1, AUD_ROUND=2, AUD_SIM=3 };
 static bool     g_audEnabled       = false;
 static AudMode  g_audMode          = AUD_CLIP;
-static uint8_t  g_audSimLevel      = 1;      // 1..3 used when mode==AUD_SIM
+static uint8_t  g_audSimLevel      = 1;      // 1..4 used when mode==AUD_SIM
 static bool     g_audAuto          = false;
 static uint32_t g_audAutoPeriodMs  = 5000;
 static uint32_t g_audNextAutoMs    = 0;
@@ -272,16 +277,18 @@ static bool     slotIsOdd_B[4] {false,false,false,false};
 // =============================================================
 
 // Round/level state:
-//   roundIdx 0 => Level 1
-//   roundIdx 1 => Level 2
-//   roundIdx 2 => Level 3 (infinite)
-static uint8_t  g_roundIdx       = 0;
-static uint8_t  g_pointsInRound  = 0;      // resets every 3 correct picks
-static uint16_t g_scoreTotal     = 0;      // total correct selections this session (PMS score)
-static uint8_t  g_lives          = MAX_LIVES;
+//   roundIdx 0 => Level 1 (new exact-common opener)
+//   roundIdx 1 => Level 2 (previous Level 1)
+//   roundIdx 2 => Level 3 (previous Level 2)
+//   roundIdx 3 => Level 4 (previous Level 3, indefinite)
+static uint8_t  g_roundIdx        = 0;
+static uint8_t  g_pointsInRound   = 0;      // resets every 5 correct picks on finite levels
+static uint16_t g_scoreTotal      = 0;      // total correct selections this session (PMS score)
+static uint8_t  g_lives           = MAX_LIVES;
 
-static uint32_t g_waitStartMs    = 0;      // when WAIT began (for timeout countdown)
-static uint32_t g_curTimeoutMs   = BASE_TIMEOUT_MS[0];
+static uint32_t g_gamePlayStartMs = 0;      // overall session start for 5-minute success
+static uint32_t g_waitStartMs     = 0;      // when WAIT began (for timeout countdown)
+static uint32_t g_curTimeoutMs    = BASE_TIMEOUT_MS[0];
 
 // =============================================================
 // PMS status/event bookkeeping
@@ -309,6 +316,12 @@ static void cmdOtaUpdate(const uint8_t mac[6], const char* url);
 static inline void gameClearRoundPushRetries();
 static void gamePushSceneToSidesNow(bool includeWhite);
 static inline void gameScheduleRoundPushRetries();
+
+// Forward declarations for level builders (used by AUD before their definitions)
+static void buildScenes_level1_exactCommon();
+static void buildScenes_level2_sub2Family();
+static void buildScenes_level3_differentBase();
+static void buildScenes_level4_sameBaseDifferentSub();
 
 // =============================================================
 // ESP-NOW network state (declared early so serial handlers compile)
@@ -339,7 +352,8 @@ static inline void prefsSaveChannel(uint8_t ch);
 // =============================================================
 
 static uint8_t seashellsLevelFromRoundIdx(uint8_t roundIdx) {
-  return (roundIdx < 2) ? (uint8_t)(roundIdx + 1) : 3;
+  if (roundIdx >= SEASHELLS_LEVEL_COUNT) return SEASHELLS_LEVEL_COUNT;
+  return (uint8_t)(roundIdx + 1);
 }
 
 static const char* pmsStateStr(PmsState st) {
@@ -433,7 +447,7 @@ static void pmsMaybeEmitGameEnd(const char* reason) {
 
 static void startGameAtLevel(uint8_t level) {
   if (level < 1) level = 1;
-  if (level > 3) level = 3;
+  if (level > SEASHELLS_LEVEL_COUNT) level = SEASHELLS_LEVEL_COUNT;
 
   // Reset session state
   g_lives         = MAX_LIVES;
@@ -441,6 +455,7 @@ static void startGameAtLevel(uint8_t level) {
   g_pointsInRound = 0;
   g_roundIdx      = (uint8_t)(level - 1);
   g_curTimeoutMs  = BASE_TIMEOUT_MS[g_roundIdx];
+  g_gamePlayStartMs = millis();
   g_waitStartMs   = 0;
 
   // Clear pick latch
@@ -471,6 +486,7 @@ static void stopGameFromHost(const char* reason) {
   g_ledWhiteRetries = 0;
   gameClearRoundPushRetries();
   g_state = IDLE;
+  g_gamePlayStartMs = 0;
   DBG_PRINTLN("[Master] Game ended -> IDLE");
 
   g_pmsLastReason = "state";
@@ -853,9 +869,10 @@ static void audApply() {
 }
 
 static void audGenerateSimScene() {
-  if (g_audSimLevel <= 1) buildScenes_level1_sub2();
-  else if (g_audSimLevel == 2) buildScenes_level2_randomBases();
-  else buildScenes_level3_subs();
+  if (g_audSimLevel <= 1) buildScenes_level1_exactCommon();
+  else if (g_audSimLevel == 2) buildScenes_level2_sub2Family();
+  else if (g_audSimLevel == 3) buildScenes_level3_differentBase();
+  else buildScenes_level4_sameBaseDifferentSub();
 }
 
 static void audEnable(AudMode mode, uint8_t simLevel=1) {
@@ -871,7 +888,7 @@ static void audEnable(AudMode mode, uint8_t simLevel=1) {
   g_audMode = mode;
   g_audSimLevel = simLevel;
   if (g_audSimLevel < 1) g_audSimLevel = 1;
-  if (g_audSimLevel > 3) g_audSimLevel = 3;
+  if (g_audSimLevel > SEASHELLS_LEVEL_COUNT) g_audSimLevel = SEASHELLS_LEVEL_COUNT;
 
   g_audAuto = false;
   g_audBtnPos = 255;
@@ -992,9 +1009,10 @@ static void audPrintHelp() {
   DBG_PRINTLN("\nModes:");
   DBG_PRINTLN("  AUD MODE CLIP    -> play ONE clip on ONE speaker (SOLOPOS)");
   DBG_PRINTLN("  AUD MODE ROUND   -> play COMMON on 7 speakers, ODD on 1 (ODDPOS)");
-  DBG_PRINTLN("  AUD MODE SIM1    -> generate real Level-1 scenes (base+sub2 family vs other base)");
-  DBG_PRINTLN("  AUD MODE SIM2    -> generate real Level-2 scenes (base vs different base)");
-  DBG_PRINTLN("  AUD MODE SIM3    -> generate real Level-3 scenes (sub vs different sub, same base)");
+  DBG_PRINTLN("  AUD MODE SIM1    -> generate real Level-1 scenes (same exact common clip x7 vs other base)");
+  DBG_PRINTLN("  AUD MODE SIM2    -> generate real Level-2 scenes (same sub2 family vs other base)");
+  DBG_PRINTLN("  AUD MODE SIM3    -> generate real Level-3 scenes (same base vs other base)");
+  DBG_PRINTLN("  AUD MODE SIM4    -> generate real Level-4 scenes (same base, different subs)");
   DBG_PRINTLN("\nPosition selection:");
   DBG_PRINTLN("  AUD SOLOPOS A0..A3 | B0..B3 | 0..7");
   DBG_PRINTLN("  AUD ODDPOS  A0..A3 | B0..B3 | 0..7");
@@ -1215,7 +1233,7 @@ static void handleLegacyLine(const String& rawLine) {
 
       if (a1u == "MODE") {
         if (a2u.length() == 0) {
-          DBG_PRINTLN("Usage: AUD MODE CLIP|ROUND|SIM1|SIM2|SIM3");
+          DBG_PRINTLN("Usage: AUD MODE CLIP|ROUND|SIM1|SIM2|SIM3|SIM4");
           return;
         }
         if (a2u == "CLIP") {
@@ -1228,19 +1246,21 @@ static void handleLegacyLine(const String& rawLine) {
           else { g_audMode = AUD_ROUND; audApply(); }
           return;
         }
-        if (a2u == "SIM1" || a2u == "SIM2" || a2u == "SIM3") {
-          uint8_t lvl = (a2u == "SIM2") ? 2 : (a2u == "SIM3") ? 3 : 1;
-          if (!g_audEnabled) {
-            audEnable(AUD_SIM, lvl);
-          } else {
-            g_audMode = AUD_SIM;
-            g_audSimLevel = lvl;
-            audGenerateSimScene();
-            audApply();
+        if (a2u.startsWith("SIM")) {
+          uint8_t lvl = (uint8_t)a2u.substring(3).toInt();
+          if (lvl >= 1 && lvl <= SEASHELLS_LEVEL_COUNT) {
+            if (!g_audEnabled) {
+              audEnable(AUD_SIM, lvl);
+            } else {
+              g_audMode = AUD_SIM;
+              g_audSimLevel = lvl;
+              audGenerateSimScene();
+              audApply();
+            }
+            return;
           }
-          return;
         }
-        DBG_PRINTLN("AUD MODE: unknown mode. Use CLIP|ROUND|SIM1|SIM2|SIM3");
+        DBG_PRINTLN("AUD MODE: unknown mode. Use CLIP|ROUND|SIM1|SIM2|SIM3|SIM4");
         return;
       }
 
@@ -1561,7 +1581,7 @@ static void handleLegacyLine(const String& rawLine) {
       Serial.println();
       Serial.println("=== Seashells Master Serial Commands ===");
       Serial.println("HELP");
-      Serial.println("START [1|2|3]         (or: START level=<1..3>)");
+      Serial.println("START [1|2|3|4]       (or: START level=<1..4>)");
       Serial.println("STOP                  (end game)");
       Serial.println("OTA [A|B|BOTH]         (trigger Side OTA update)");
       Serial.println("CHAN <1-13>            (set ESP-NOW channel, persist to NVS, reboot)");
@@ -1599,8 +1619,8 @@ static void handleLegacyLine(const String& rawLine) {
           }
         }
       }
-      if (level < 1 || level > 3) {
-        Serial.println("Usage: START [1|2|3]   (or START level=<1..3>)");
+      if (level < 1 || level > SEASHELLS_LEVEL_COUNT) {
+        Serial.println("Usage: START [1|2|3|4] (or START level=<1..4>)");
         return;
       }
       startGameAtLevel((uint8_t)level);
@@ -2399,46 +2419,10 @@ static void fillWithUniqueThenReuse(uint16_t* dest, size_t needed, uint16_t* uni
 
 // ---------- Level builders ----------
 
-// Level 2: 7 from baseMain, 1 from baseOdd
-static void buildScenes_level2_randomBases() {
-  const char* bases[8];
-  size_t baseCount = collectUniqueBases(bases, 8);
-
-  if (baseCount < 2) {
-    DBG_PRINTLN("[Master] Level2: need >=2 bases, falling back to trivial (all from same base)");
-    baseCount = collectUniqueBases(bases, 8);
-  }
-
-  size_t idxMain = (size_t)random((long)baseCount);
-  size_t idxOdd  = (baseCount > 1) ? (size_t)random((long)(baseCount - 1)) : idxMain;
-  if (baseCount > 1 && idxOdd >= idxMain) idxOdd++;
-
-  const char* baseMain = bases[idxMain];
-  const char* baseOdd  = bases[idxOdd];
-
-  uint16_t unique[32];
-  uint16_t sameIds[7];
-
-  size_t uCount = collectIdsByBase(baseMain, unique, 32);
-  if (uCount == 0) {
-    DBG_PRINTLN("[Master] Level2: no IDs for baseMain, using any IDs");
-    for (int i=0;i<7;i++) sameIds[i] = pickAnyAllowedId();
-  } else {
-    fillWithUniqueThenReuse(sameIds, 7, unique, uCount, "Level2 baseMain");
-  }
-
-  uint16_t oddId;
-  uint16_t uniqueOdd[32];
-  size_t uOddCount = collectIdsByBase(baseOdd, uniqueOdd, 32);
-  if (uOddCount == 0) {
-    oddId = pickAnyAllowedId();
-  } else {
-    shuffleArray(uniqueOdd, uOddCount);
-    oddId = uniqueOdd[0];
-  }
-
-  uint8_t sideOdd = random(2);
-  uint8_t oddSlot = random(4);
+static void populateScenesWithOdd(const uint16_t sameIds[7], uint16_t oddId,
+                                  uint8_t& sideOdd, uint8_t& oddSlot) {
+  sideOdd = random(2);
+  oddSlot = random(4);
   int sameIdx = 0;
 
   if (sideOdd == 0) {
@@ -2457,20 +2441,129 @@ static void buildScenes_level2_randomBases() {
 
   for (int i=0;i<4;i++) slotIsOdd_A[i] = (sceneA[i] == oddId);
   for (int i=0;i<4;i++) slotIsOdd_B[i] = (sceneB[i] == oddId);
+}
 
-  DBG_PRINTF("[Master] Level2: baseMain=%s baseOdd=%s sideOdd=%u oddSlot=%u\n",
-                baseMain, baseOdd, (unsigned)sideOdd, (unsigned)oddSlot);
+// Level 3: 7 from baseMain, 1 from baseOdd (different base when available)
+static void buildScenes_level3_differentBase() {
+  const char* bases[8];
+  size_t baseCount = collectUniqueBases(bases, 8);
+
+  uint16_t sameIds[7];
+  uint16_t oddId = 0;
+  const char* baseMain = nullptr;
+  const char* baseOdd  = nullptr;
+
+  if (baseCount == 0) {
+    DBG_PRINTLN("[Master] Level3: no bases, using any allowed IDs");
+    for (int i=0; i<7; i++) sameIds[i] = pickAnyAllowedId();
+    oddId = pickAnyAllowedId();
+  } else {
+    size_t idxMain = (size_t)random((long)baseCount);
+    size_t idxOdd  = idxMain;
+    if (baseCount > 1) {
+      idxOdd = (size_t)random((long)(baseCount - 1));
+      if (idxOdd >= idxMain) idxOdd++;
+    }
+
+    baseMain = bases[idxMain];
+    baseOdd  = bases[idxOdd];
+
+    uint16_t unique[32];
+    size_t uCount = collectIdsByBase(baseMain, unique, 32);
+    if (uCount == 0) {
+      DBG_PRINTLN("[Master] Level3: no IDs for baseMain, using any allowed IDs");
+      for (int i=0; i<7; i++) sameIds[i] = pickAnyAllowedId();
+    } else {
+      fillWithUniqueThenReuse(sameIds, 7, unique, uCount, "Level3 baseMain");
+    }
+
+    uint16_t uniqueOdd[32];
+    size_t uOddCount = collectIdsByBase(baseOdd, uniqueOdd, 32);
+    if (uOddCount == 0) {
+      oddId = (baseMain != nullptr) ? pickRandomIdByBase(baseMain) : pickAnyAllowedId();
+    } else {
+      shuffleArray(uniqueOdd, uOddCount);
+      oddId = uniqueOdd[0];
+    }
+  }
+
+  uint8_t sideOdd = 0, oddSlot = 0;
+  populateScenesWithOdd(sameIds, oddId, sideOdd, oddSlot);
+
+  DBG_PRINTF("[Master] Level3: baseMain=%s baseOdd=%s sideOdd=%u oddSlot=%u\n",
+             baseMain ? baseMain : "(any)",
+             baseOdd  ? baseOdd  : "(same/any)",
+             (unsigned)sideOdd,
+             (unsigned)oddSlot);
   for (int i=0;i<4;i++) printIdInfo("  sceneA", sceneA[i]);
   for (int i=0;i<4;i++) printIdInfo("  sceneB", sceneB[i]);
 }
 
-// Level 1: 7 from one sub2 family of a random base, 1 from a different base
-static void buildScenes_level1_sub2() {
+// Level 2: 7 from one sub2 family of a random base, 1 from a different base
+static void buildScenes_level2_sub2Family() {
+  const char* bases[8];
+  size_t baseCount = collectUniqueBases(bases, 8);
+  if (baseCount < 2) {
+    DBG_PRINTLN("[Master] Level2: need >=2 bases, fallback to Level3");
+    buildScenes_level3_differentBase();
+    return;
+  }
+
+  size_t idxMain = (size_t)random((long)baseCount);
+  const char* baseMain = bases[idxMain];
+
+  const char* sub2List[16];
+  size_t sub2Count = collectUniqueSub2ForBase(baseMain, sub2List, 16);
+  if (sub2Count == 0) {
+    DBG_PRINTLN("[Master] Level2: no sub2 families for baseMain, fallback to Level3");
+    buildScenes_level3_differentBase();
+    return;
+  }
+
+  size_t idxFamily = (size_t)random((long)sub2Count);
+  const char* familySub2 = sub2List[idxFamily];
+
+  size_t idxOdd = (size_t)random((long)(baseCount - 1));
+  if (idxOdd >= idxMain) idxOdd++;
+  const char* baseOdd = bases[idxOdd];
+
+  uint16_t unique[32];
+  uint16_t sameIds[7];
+
+  size_t uCount = collectIdsByBaseSub2(baseMain, familySub2, unique, 32);
+  if (uCount == 0) {
+    DBG_PRINTLN("[Master] Level2: no IDs for baseMain+sub2, fallback to Level3");
+    buildScenes_level3_differentBase();
+    return;
+  }
+  fillWithUniqueThenReuse(sameIds, 7, unique, uCount, "Level2 base+sub2");
+
+  uint16_t oddId;
+  uint16_t uniqueOdd[32];
+  size_t uOddCount = collectIdsByBase(baseOdd, uniqueOdd, 32);
+  if (uOddCount == 0) {
+    oddId = pickAnyAllowedId();
+  } else {
+    shuffleArray(uniqueOdd, uOddCount);
+    oddId = uniqueOdd[0];
+  }
+
+  uint8_t sideOdd = 0, oddSlot = 0;
+  populateScenesWithOdd(sameIds, oddId, sideOdd, oddSlot);
+
+  DBG_PRINTF("[Master] Level2: baseMain=%s familySub2=%s baseOdd=%s sideOdd=%u oddSlot=%u\n",
+             baseMain, familySub2, baseOdd, (unsigned)sideOdd, (unsigned)oddSlot);
+  for (int i=0;i<4;i++) printIdInfo("  sceneA", sceneA[i]);
+  for (int i=0;i<4;i++) printIdInfo("  sceneB", sceneB[i]);
+}
+
+// Level 1: same as Level 2, but all 7 common slots use the exact same clip ID
+static void buildScenes_level1_exactCommon() {
   const char* bases[8];
   size_t baseCount = collectUniqueBases(bases, 8);
   if (baseCount < 2) {
     DBG_PRINTLN("[Master] Level1: need >=2 bases, fallback to Level2");
-    buildScenes_level2_randomBases();
+    buildScenes_level2_sub2Family();
     return;
   }
 
@@ -2481,7 +2574,7 @@ static void buildScenes_level1_sub2() {
   size_t sub2Count = collectUniqueSub2ForBase(baseMain, sub2List, 16);
   if (sub2Count == 0) {
     DBG_PRINTLN("[Master] Level1: no sub2 families for baseMain, fallback to Level2");
-    buildScenes_level2_randomBases();
+    buildScenes_level2_sub2Family();
     return;
   }
 
@@ -2498,10 +2591,13 @@ static void buildScenes_level1_sub2() {
   size_t uCount = collectIdsByBaseSub2(baseMain, familySub2, unique, 32);
   if (uCount == 0) {
     DBG_PRINTLN("[Master] Level1: no IDs for baseMain+sub2, fallback to Level2");
-    buildScenes_level2_randomBases();
+    buildScenes_level2_sub2Family();
     return;
   }
-  fillWithUniqueThenReuse(sameIds, 7, unique, uCount, "Level1 base+sub2");
+
+  shuffleArray(unique, uCount);
+  const uint16_t commonId = unique[0];
+  for (int i=0; i<7; i++) sameIds[i] = commonId;
 
   uint16_t oddId;
   uint16_t uniqueOdd[32];
@@ -2513,40 +2609,22 @@ static void buildScenes_level1_sub2() {
     oddId = uniqueOdd[0];
   }
 
-  uint8_t sideOdd = random(2);
-  uint8_t oddSlot = random(4);
-  int sameIdx = 0;
+  uint8_t sideOdd = 0, oddSlot = 0;
+  populateScenesWithOdd(sameIds, oddId, sideOdd, oddSlot);
 
-  if (sideOdd == 0) {
-    for (int i=0; i<4; i++) {
-      if (i == oddSlot) sceneA[i] = oddId;
-      else              sceneA[i] = sameIds[sameIdx++];
-    }
-    for (int i=0; i<4; i++) sceneB[i] = sameIds[sameIdx++];
-  } else {
-    for (int i=0; i<4; i++) sceneA[i] = sameIds[sameIdx++];
-    for (int i=0; i<4; i++) {
-      if (i == oddSlot) sceneB[i] = oddId;
-      else              sceneB[i] = sameIds[sameIdx++];
-    }
-  }
-
-  for (int i=0;i<4;i++) slotIsOdd_A[i] = (sceneA[i] == oddId);
-  for (int i=0;i<4;i++) slotIsOdd_B[i] = (sceneB[i] == oddId);
-
-  DBG_PRINTF("[Master] Level1: baseMain=%s familySub2=%s baseOdd=%s sideOdd=%u oddSlot=%u\n",
-                baseMain, familySub2, baseOdd, (unsigned)sideOdd, (unsigned)oddSlot);
+  DBG_PRINTF("[Master] Level1: baseMain=%s familySub2=%s commonId=%u baseOdd=%s sideOdd=%u oddSlot=%u\n",
+             baseMain, familySub2, (unsigned)commonId, baseOdd, (unsigned)sideOdd, (unsigned)oddSlot);
   for (int i=0;i<4;i++) printIdInfo("  sceneA", sceneA[i]);
   for (int i=0;i<4;i++) printIdInfo("  sceneB", sceneB[i]);
 }
 
-// Level 3: 7 from one sub of a base, 1 from a different sub of same base
-static void buildScenes_level3_subs() {
+// Level 4: 7 from one sub of a base, 1 from a different sub of the same base
+static void buildScenes_level4_sameBaseDifferentSub() {
   const char* bases[8];
   size_t baseCount = collectUniqueBases(bases, 8);
   if (baseCount == 0) {
-    DBG_PRINTLN("[Master] Level3: no bases, fallback to Level2");
-    buildScenes_level2_randomBases();
+    DBG_PRINTLN("[Master] Level4: no bases, fallback to Level3");
+    buildScenes_level3_differentBase();
     return;
   }
 
@@ -2565,8 +2643,8 @@ static void buildScenes_level3_subs() {
   }
 
   if (!baseMain || subCount < 2) {
-    DBG_PRINTLN("[Master] Level3: no base with >=2 subs, fallback to Level2");
-    buildScenes_level2_randomBases();
+    DBG_PRINTLN("[Master] Level4: no base with >=2 subs, fallback to Level3");
+    buildScenes_level3_differentBase();
     return;
   }
 
@@ -2582,11 +2660,11 @@ static void buildScenes_level3_subs() {
 
   size_t uCount = collectIdsByBaseSub(baseMain, subSame, unique, 32);
   if (uCount == 0) {
-    DBG_PRINTLN("[Master] Level3: no IDs for baseMain+subSame, fallback to Level2");
-    buildScenes_level2_randomBases();
+    DBG_PRINTLN("[Master] Level4: no IDs for baseMain+subSame, fallback to Level3");
+    buildScenes_level3_differentBase();
     return;
   }
-  fillWithUniqueThenReuse(sameIds, 7, unique, uCount, "Level3 base+subSame");
+  fillWithUniqueThenReuse(sameIds, 7, unique, uCount, "Level4 base+subSame");
 
   uint16_t oddId;
   uint16_t uniqueOdd[32];
@@ -2598,29 +2676,11 @@ static void buildScenes_level3_subs() {
     oddId = uniqueOdd[0];
   }
 
-  uint8_t sideOdd = random(2);
-  uint8_t oddSlot = random(4);
-  int sameIdx = 0;
+  uint8_t sideOdd = 0, oddSlot = 0;
+  populateScenesWithOdd(sameIds, oddId, sideOdd, oddSlot);
 
-  if (sideOdd == 0) {
-    for (int i=0; i<4; i++) {
-      if (i == oddSlot) sceneA[i] = oddId;
-      else              sceneA[i] = sameIds[sameIdx++];
-    }
-    for (int i=0; i<4; i++) sceneB[i] = sameIds[sameIdx++];
-  } else {
-    for (int i=0; i<4; i++) sceneA[i] = sameIds[sameIdx++];
-    for (int i=0; i<4; i++) {
-      if (i == oddSlot) sceneB[i] = oddId;
-      else              sceneB[i] = sameIds[sameIdx++];
-    }
-  }
-
-  for (int i=0;i<4;i++) slotIsOdd_A[i] = (sceneA[i] == oddId);
-  for (int i=0;i<4;i++) slotIsOdd_B[i] = (sceneB[i] == oddId);
-
-  DBG_PRINTF("[Master] Level3: baseMain=%s subSame=%s subOdd=%s sideOdd=%u oddSlot=%u\n",
-                baseMain, subSame, subOdd, (unsigned)sideOdd, (unsigned)oddSlot);
+  DBG_PRINTF("[Master] Level4: baseMain=%s subSame=%s subOdd=%s sideOdd=%u oddSlot=%u\n",
+             baseMain, subSame, subOdd, (unsigned)sideOdd, (unsigned)oddSlot);
   for (int i=0;i<4;i++) printIdInfo("  sceneA", sceneA[i]);
   for (int i=0;i<4;i++) printIdInfo("  sceneB", sceneB[i]);
 }
@@ -2806,7 +2866,7 @@ static void nowInit() {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  DBG_PRINTLN("[Master] Odd One Out (Rounds 1/2/3 + unique-first + lives + shrinking timeout)");
+  DBG_PRINTLN("[Master] Odd One Out (Levels 1/2/3/4 + lives + shrinking timeout + 5m success)");
 
   nowInit();
 
@@ -2852,6 +2912,23 @@ void loop() {
     return;
   }
 
+  // Overall success condition: survive 5 minutes of active play.
+  // Keep STATUS tleft_ms tied to the per-round selection timer; only the
+  // final game_end reason uses this overall timer.
+  if (g_state != IDLE && g_gamePlayStartMs != 0) {
+    const uint32_t nowMs = millis();
+    if ((uint32_t)(nowMs - g_gamePlayStartMs) >= GAME_SUCCESS_PLAY_MS) {
+      cmdStopAll();
+      g_ledWhiteRetries = 0;
+      gameClearRoundPushRetries();
+      g_state = IDLE;
+      g_gamePlayStartMs = 0;
+      g_pmsLastReason = "state";
+      DBG_PRINTLN("[Master] SUCCESS TIMER ELAPSED -> GAME OVER");
+      pmsMaybeEmitGameEnd("success");
+      return;
+    }
+  }
 
   switch (g_state) {
     case IDLE:
@@ -2859,14 +2936,17 @@ void loop() {
 
     case BUILD: {
       if (g_roundIdx == 0) {
-        buildScenes_level1_sub2();
-        DBG_PRINTLN("[Master] Using Level 1 (round 1)");
+        buildScenes_level1_exactCommon();
+        DBG_PRINTLN("[Master] Using Level 1 (new identical-common opener)");
       } else if (g_roundIdx == 1) {
-        buildScenes_level2_randomBases();
-        DBG_PRINTLN("[Master] Using Level 2 (round 2)");
+        buildScenes_level2_sub2Family();
+        DBG_PRINTLN("[Master] Using Level 2 (previous Level 1)");
+      } else if (g_roundIdx == 2) {
+        buildScenes_level3_differentBase();
+        DBG_PRINTLN("[Master] Using Level 3 (previous Level 2)");
       } else {
-        buildScenes_level3_subs();
-        DBG_PRINTLN("[Master] Using Level 3 (round 3 - infinite)");
+        buildScenes_level4_sameBaseDifferentSub();
+        DBG_PRINTLN("[Master] Using Level 4 (previous Level 3 - indefinite)");
       }
 
       // Send the new scenes to each Side (unicast once each Side is discovered).
@@ -2979,24 +3059,26 @@ void loop() {
           g_curTimeoutMs = newTimeout;
           DBG_PRINTF("[Master] Timeout decayed to %lums\n", (unsigned long)g_curTimeoutMs);
 
-          // Round progression logic
-          if (++g_pointsInRound >= 3) {
-            g_pointsInRound = 0;
-
-            if (g_roundIdx < 2) {
-              // Finished round 1 or 2 -> go to next round, reset timeout for that round
+          // Level progression logic
+          if (g_roundIdx < SEASHELLS_LAST_LEVEL_INDEX) {
+            if (++g_pointsInRound >= CORRECT_PICKS_TO_ADVANCE) {
+              g_pointsInRound = 0;
+              const uint8_t finishedLevel = seashellsLevelFromRoundIdx(g_roundIdx);
               g_roundIdx++;
               g_curTimeoutMs = BASE_TIMEOUT_MS[g_roundIdx];
-              DBG_PRINTF("[Master] Round %u complete -> next round (timeout reset to %lums)\n",
-                         (unsigned)g_roundIdx, (unsigned long)g_curTimeoutMs);
+              DBG_PRINTF("[Master] Level %u complete -> next level (timeout reset to %lums)\n",
+                         (unsigned)finishedLevel,
+                         (unsigned long)g_curTimeoutMs);
               nextAfterBlink = BUILD;
             } else {
-              // Round 3 is infinite: stay in round 3, don't "win" by points
-              DBG_PRINTLN("[Master] Round 3: correct point, staying in infinite round");
+              DBG_PRINTF("[Master] Point %u/%u in current level\n",
+                         (unsigned)g_pointsInRound,
+                         (unsigned)CORRECT_PICKS_TO_ADVANCE);
               nextAfterBlink = BUILD;
             }
           } else {
-            DBG_PRINTF("[Master] Point %u in current round\n", (unsigned)g_pointsInRound);
+            g_pointsInRound = 0;
+            DBG_PRINTLN("[Master] Level 4: correct point, staying in indefinite level");
             nextAfterBlink = BUILD;
           }
           g_state = PAUSE;
